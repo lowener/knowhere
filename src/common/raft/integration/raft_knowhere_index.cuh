@@ -119,9 +119,9 @@ using raft_search_params_t = typename detail::raft_index_type_mapper<true, Index
 metric_string_to_cuvs_distance_type(std::string const& metric_string) {
     auto result = cuvs::distance::DistanceType::L2Expanded;
     if (metric_string == "L2") {
-        result = raft::distance::DistanceType::L2Expanded;
+        result = cuvs::distance::DistanceType::L2Expanded;
     } else if (metric_string == "COSINE") {
-        result = raft::distance::DistanceType::InnerProduct;
+        result = cuvs::distance::DistanceType::InnerProduct;
     } else if (metric_string == "L2SqrtExpanded") {
         result = cuvs::distance::DistanceType::L2SqrtExpanded;
     } else if (metric_string == "CosineExpanded") {

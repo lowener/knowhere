@@ -285,7 +285,7 @@ class Benchmark_float_qps : public Benchmark_knowhere, public ::testing::Test {
         knowhere::KnowhereConfig::InitGPUResource(GPU_DEVICE_ID, 2);
         cfg_[knowhere::meta::DEVICE_ID] = GPU_DEVICE_ID;
 #endif
-#ifdef KNOWHERE_WITH_RAFT
+#ifdef KNOWHERE_WITH_CUVS
         knowhere::KnowhereConfig::SetRaftMemPool();
 #endif
     }
@@ -325,7 +325,7 @@ class Benchmark_float_qps : public Benchmark_knowhere, public ::testing::Test {
 TEST_F(Benchmark_float_qps, TEST_IVF_FLAT) {
 #ifdef KNOWHERE_WITH_GPU
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_GPU_IVFFLAT;
-#elif KNOWHERE_WITH_RAFT
+#elif KNOWHERE_WITH_CUVS
     index_type_ = knowhere::IndexEnum::INDEX_RAFT_IVFFLAT;
 #else
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_IVFFLAT;
@@ -375,7 +375,7 @@ TEST_F(Benchmark_float_qps, TEST_IVF_SQ8) {
 TEST_F(Benchmark_float_qps, TEST_IVF_PQ) {
 #ifdef KNOWHERE_WITH_GPU
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_GPU_IVFPQ;
-#elif KNOWHERE_WITH_RAFT
+#elif KNOWHERE_WITH_CUVS
     index_type_ = knowhere::IndexEnum::INDEX_RAFT_IVFPQ;
 #else
     index_type_ = knowhere::IndexEnum::INDEX_FAISS_IVFPQ;

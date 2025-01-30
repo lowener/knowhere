@@ -118,6 +118,8 @@ class KnowhereConan(ConanFile):
             self.requires("hdf5/1.14.0")
         if self.options.with_faiss_tests:
             self.requires("gtest/1.13.0")
+        if self.options.with_cuvs:
+            self.requires("ccache/4.5.1")
 
     @property
     def _required_boost_components(self):
@@ -178,6 +180,8 @@ class KnowhereConan(ConanFile):
         tc.variables["WITH_COVERAGE"] = self.options.with_coverage
         tc.variables["WITH_FAISS_TESTS"] = self.options.with_faiss_tests
         tc.variables["WITH_LIGHT"] = self.options.with_light
+        tc.variables["CMAKE_CUDA_COMPILER_LAUNCHER"] = "ccache"
+        tc.variables["CMAKE_CXX_COMPILER_LAUNCHER"] = "ccache"
         tc.generate()
 
         deps = CMakeDeps(self)

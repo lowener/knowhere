@@ -24,7 +24,7 @@ include(cmake/utils/platform_check.cmake)
 
 knowhere_option(WITH_CUVS "Build with CUVS indexes" OFF)
 if(WITH_CUVS)
-  set(CMAKE_CUDA_ARCHITECTURES RAPIDS)
+  set(CMAKE_CUDA_ARCHITECTURES NATIVE)
   include(cmake/libs/librapids.cmake)
   project(knowhere CXX C CUDA)
   include(cmake/libs/libcuvs.cmake)
@@ -204,6 +204,10 @@ if(WITH_CUVS)
     APPEND
     KNOWHERE_LINKER_LIBS
     raft::raft
+    raft::raft_logger
+    raft::raft_logger_impl
+    rmm::rmm_logger
+    rmm::rmm_logger_impl
     cuvs::cuvs
     CUDA::cublas
     CUDA::cusparse

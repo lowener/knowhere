@@ -9,8 +9,11 @@
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <limits>
 #include <numeric>
 #include <random>
+#include <string>
 #include <vector>
 
 #include <faiss/Index.h>
@@ -28,6 +31,7 @@
 #include <faiss/IndexIVFFlat.h>
 #include <faiss/IndexIVFIndependentQuantizer.h>
 #include <faiss/IndexIVFPQ.h>
+#include <faiss/IndexIVFPQFastScan.h>
 #include <faiss/IndexIVFPQR.h>
 #include <faiss/IndexRaBitQFastScan.h>
 #include <faiss/IndexScalarQuantizer.h>
@@ -149,6 +153,32 @@ TEST(ReadIndexDeserialize, PQWithMZeroDivideByZero) {
     push_pq(buf, /*d=*/4, /*M=*/0, /*nbits=*/8);
 
     expect_read_throws(buf);
+}
+
+// -----------------------------------------------------------------------
+// Test: a non-{0,1} byte at a bool field position must be rejected as
+// FaissException rather than silently producing an invalid bool value.
+// Reading a non-canonical byte directly into a bool is UB and trips
+// UBSan's invalid-bool-load check; the READ1_BOOL helper routes every
+// bool READ1 through a value check and throws on anything outside {0,1}.
+// is_trained, read inside read_index_header, exercises the helper from
+// the most common deserialization path.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IndexHeaderInvalidBoolEncodingIsTrained) {
+    // Minimal IndexFlatL2 ("IxF2") with ntotal=0 - read_index_header is
+    // the first thing the deserializer consumes for this fourcc.
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IxF2");
+    push_index_header(buf, /*d=*/4, /*ntotal=*/0);
+
+    // is_trained sits at offset 4 (fourcc) + 4 (d) + 8 (ntotal) +
+    // 8 (dummy) + 8 (dummy) = 32. push_index_header writes 0x01 there;
+    // overwrite with a non-canonical bool byte.
+    constexpr size_t is_trained_offset = 32;
+    ASSERT_EQ(buf[is_trained_offset], uint8_t{1});
+    buf[is_trained_offset] = 0x02;
+
+    expect_read_throws_with(buf, "invalid bool encoding");
 }
 
 // -----------------------------------------------------------------------
@@ -414,6 +444,58 @@ TEST(ReadIndexDeserialize, IndexLatticeR2TooLarge) {
     push_val<int>(buf, 73); // r2 = 73 (decode cache too large for dsq=16)
 
     expect_read_throws_with(buf, "decode cache");
+}
+
+// -----------------------------------------------------------------------
+// Test: the configurable deserialization_lattice_r2_limit rejects
+// IndexLattice payloads whose r2 exceeds the limit, separately from
+// the in-codec decode-cache memory cap.  The limit's purpose is to
+// let callers that operate on untrusted index payloads cap the
+// ZnSphereCodecRec decode-cache build cost (which grows polynomially
+// in r2) before it dominates load time, even for parameter
+// combinations that the memory cap permits.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IndexLatticeR2ConfigurableLimit) {
+    const size_t old_limit = get_deserialization_lattice_r2_limit();
+
+    // d=4, nsq=1, scale_nbit=4 produces dsq=4 -- a configuration that
+    // passes the existing structural checks.  r2 at the limit must
+    // deserialize cleanly (the cap is "r2 > limit", not "r2 >= limit");
+    // r2 above the limit must be rejected with a FaissException whose
+    // message names the limit, before the IndexLattice constructor
+    // (and the underlying ZnSphereCodecRec) is invoked.
+    constexpr int d = 4;
+    auto build = [](int r2) {
+        std::vector<uint8_t> buf;
+        push_fourcc(buf, "IxLa");
+        push_val<int>(buf, d);  // d
+        push_val<int>(buf, 1);  // nsq
+        push_val<int>(buf, 4);  // scale_nbit
+        push_val<int>(buf, r2); // r2
+        push_index_header(buf, d, /*ntotal=*/0);
+        // Untrained: empty trained vector.
+        push_vector<float>(buf, {});
+        return buf;
+    };
+
+    set_deserialization_lattice_r2_limit(2);
+    {
+        // r2 == limit: the limit check passes (since it is r2 > limit,
+        // not r2 >= limit) and the underlying ZnSphereCodecRec
+        // constructor runs to completion.
+        auto buf = build(2);
+        VectorIOReader reader;
+        reader.data = buf;
+        EXPECT_NO_THROW(read_index_up(&reader));
+    }
+    {
+        // r2 == limit + 1: rejected at the limit check with the
+        // configured limit value in the error message.
+        auto buf = build(3);
+        expect_read_throws_with(buf, "deserialization_lattice_r2_limit");
+    }
+
+    set_deserialization_lattice_r2_limit(old_limit);
 }
 
 // -----------------------------------------------------------------------
@@ -1995,6 +2077,36 @@ TEST(ReadIndexDeserialize, PreTransformChainDimensionMismatch) {
     expect_read_throws_with(buf, "d_out=4");
 }
 
+// Test: IndexPreTransform with an *empty* chain must still agree with its
+// sub-index on d. With no transform, reconstruct() hands the caller's
+// buffer -- sized from the outer d -- straight to the sub-index, so a
+// larger sub-index d is a heap overflow (T287094917).
+TEST(ReadIndexDeserialize, PreTransformEmptyChainDimensionMismatch) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IxPT");
+    push_index_header(buf, /*d=*/4, /*ntotal=*/0);
+    push_val<int>(buf, 0); // nt = 0, empty chain
+    push_minimal_flat(buf, /*d=*/8);
+
+    expect_read_throws_with(buf, "IndexPreTransform empty chain");
+}
+
+// A well-formed empty-chain IxPT still deserializes.
+TEST(ReadIndexDeserialize, PreTransformEmptyChainMatchingDimensionAccepted) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IxPT");
+    push_index_header(buf, /*d=*/8, /*ntotal=*/0);
+    push_val<int>(buf, 0); // nt = 0, empty chain
+    push_minimal_flat(buf, /*d=*/8);
+
+    VectorIOReader reader;
+    reader.data = buf;
+    EXPECT_NO_THROW({
+        auto idx = read_index_up(&reader);
+        EXPECT_NE(idx, nullptr);
+    });
+}
+
 TEST(ReadIndexDeserialize, HadamardRotationInvalidDout) {
     // HRot format: fourcc("HRot") + seed(int) + d_in(int) + d_out(int) +
     //              is_trained(bool)
@@ -2147,6 +2259,18 @@ TEST(ReadIndexDeserialize, InvertedListOversizedEntry) {
     expect_read_throws_with(buf, "deserialization byte limit");
 
     set_deserialization_vector_byte_limit(old_limit);
+}
+
+TEST(ReadIndexDeserialize, OnDiskInvertedListsShortListsVectorRejected) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IwFl");
+    push_ivf_header(buf, /*d=*/4);
+    push_fourcc(buf, "ilod");
+    push_val<size_t>(buf, 1);  // nlist = 1
+    push_val<size_t>(buf, 16); // code_size = 16
+    push_val<size_t>(buf, 0);  // lists: empty, inconsistent with nlist = 1
+
+    expect_read_throws_with(buf, "read 0 lists for nlist 1");
 }
 
 // -- Ixrq (IndexRaBitQ, single-bit) --
@@ -2742,8 +2866,8 @@ TEST(ReadIndexDeserialize, AdditiveQuantizerMZero) {
 }
 
 // -----------------------------------------------------------------------
-// Test: ResidualCoarseQuantizer with ntotal=0 deserializes successfully
-// (empty index is valid).
+// Test: ResidualCoarseQuantizer with ntotal inconsistent with its codebooks
+// is rejected before centroid norms are computed.
 // -----------------------------------------------------------------------
 TEST(ReadIndexDeserialize, ResidualCoarseQuantizerNtotalZero) {
     std::vector<uint8_t> buf;
@@ -2752,10 +2876,7 @@ TEST(ReadIndexDeserialize, ResidualCoarseQuantizerNtotalZero) {
     push_residual_quantizer(buf, /*d=*/4, /*M=*/2, /*nbits=*/{4, 4});
     push_val<float>(buf, -1.0f); // beam_factor = -1 (skip tables)
 
-    VectorIOReader reader;
-    reader.data = buf;
-    auto idx = read_index_up(&reader);
-    EXPECT_EQ(idx->ntotal, 0);
+    expect_read_throws_with(buf, "inconsistent with 2^tot_bits");
 }
 
 // ---- IndexBinaryIVF runtime safety checks ----
@@ -3900,6 +4021,217 @@ TEST(ReadIndexDeserialize,
             faiss::FaissException);
 }
 
+// -----------------------------------------------------------------------
+// Test: read_ivfpq bounds the derived (not-stored) IVFPQ precomputed table
+// by the deserialization vector byte limit before recomputing it. The table
+// is quantizer->ntotal * pq.M * pq.ksub floats and is taken from
+// attacker-controlled header fields, so a small crafted index can drive a
+// large allocation (memory-amplification DoS reachable from read_index and
+// the binary index fuzzer). With a low limit the read must throw rather than
+// allocate.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IVFPQPrecomputedTableExceedsByteLimit) {
+    const int d = 16;
+    const int nlist = 256;
+    const int M = 8;
+    const int nbits = 8; // ksub = 256
+
+    IndexFlatL2 quantizer(d);
+    IndexIVFPQ index(&quantizer, d, nlist, M, nbits);
+    ASSERT_TRUE(index.by_residual); // precompute_table() runs on read
+
+    const int nt = 10000;
+    std::vector<float> xt(size_t(nt) * d);
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    for (auto& v : xt) {
+        v = u(rng);
+    }
+    index.train(nt, xt.data());
+    index.add(nt, xt.data());
+
+    VectorIOWriter writer;
+    write_index(&index, &writer);
+
+    // Recomputed table = ntotal(256) * M(8) * ksub(256) = 524288 floats (2 MB).
+    const size_t table_elems = size_t(nlist) * M * (size_t{1} << nbits);
+    const size_t old_limit = get_deserialization_vector_byte_limit();
+
+    // Cap the limit at 256 KB (65536 floats) so the precompute table is over
+    // the limit while the smaller derived reads (PQ centroids ~16 KB, inverted
+    // lists) stay under it. Pin the message so the throw can only come from the
+    // precompute-table guard, not some other byte-limit check.
+    set_deserialization_vector_byte_limit(size_t{1} << 18); // 256 KB
+    {
+        VectorIOReader reader;
+        reader.data = writer.data;
+        try {
+            read_index(&reader);
+            FAIL() << "expected FaissException";
+        } catch (const faiss::FaissException& e) {
+            EXPECT_NE(
+                    std::string(e.what()).find("precomputed_table"),
+                    std::string::npos)
+                    << "expected precompute-table guard, got: " << e.what();
+        }
+    }
+
+    // Just above the table size the index still loads (positive control).
+    set_deserialization_vector_byte_limit((table_elems + 1) * sizeof(float));
+    {
+        VectorIOReader reader;
+        reader.data = writer.data;
+        EXPECT_NO_THROW(read_index_up(&reader));
+    }
+
+    set_deserialization_vector_byte_limit(old_limit);
+}
+
+// -----------------------------------------------------------------------
+// Test: the same precompute-table bound guards the IVFPQFastScan (IwPf) read
+// path, whose precompute_table() call is unconditional. nbits=4 -> ksub=16, so
+// the recomputed table = ntotal(256) * M(8) * ksub(16) = 32768 floats (128 KB).
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IVFPQFastScanPrecomputedTableExceedsByteLimit) {
+    const int d = 16;
+    const int nlist = 256;
+    const int M = 8;
+    const int nbits = 4; // ksub = 16
+
+    IndexFlatL2 quantizer(d);
+    IndexIVFPQFastScan index(&quantizer, d, nlist, M, nbits);
+
+    const int nt = 10000;
+    std::vector<float> xt(size_t(nt) * d);
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+    for (auto& v : xt) {
+        v = u(rng);
+    }
+    index.train(nt, xt.data());
+    index.add(nt, xt.data());
+
+    VectorIOWriter writer;
+    write_index(&index, &writer);
+
+    const size_t table_elems = size_t(nlist) * M * (size_t{1} << nbits);
+    const size_t old_limit = get_deserialization_vector_byte_limit();
+
+    // 64 KB (16384 floats) is below the 32768-float table but above the smaller
+    // derived reads. Pin the message so only the precompute-table guard
+    // matches.
+    set_deserialization_vector_byte_limit(size_t{1} << 16); // 64 KB
+    {
+        VectorIOReader reader;
+        reader.data = writer.data;
+        try {
+            read_index(&reader);
+            FAIL() << "expected FaissException";
+        } catch (const faiss::FaissException& e) {
+            EXPECT_NE(
+                    std::string(e.what()).find("precomputed_table"),
+                    std::string::npos)
+                    << "expected precompute-table guard, got: " << e.what();
+        }
+    }
+
+    // Just above the table size the index still loads (positive control).
+    set_deserialization_vector_byte_limit((table_elems + 1) * sizeof(float));
+    {
+        VectorIOReader reader;
+        reader.data = writer.data;
+        EXPECT_NO_THROW(read_index_up(&reader));
+    }
+
+    set_deserialization_vector_byte_limit(old_limit);
+}
+
+// -----------------------------------------------------------------------
+// Test: read_ivfpq rejects a null coarse quantizer rather than dereferencing
+// it. read_ivf_header deserializes the coarse quantizer via read_index, which
+// returns nullptr for a crafted "null" fourcc. The explicit null check right
+// after read_ivf_header must throw cleanly, before the precompute-table guard
+// (or precompute_table itself) dereferences quantizer->ntotal.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IVFPQNullQuantizerReadRejected) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IwPQ");
+    // read_ivf_header: index_header (is_trained=true), nlist, nprobe,
+    // coarse quantizer, direct_map.
+    push_index_header(buf, /*d=*/4, /*ntotal=*/0, /*is_trained=*/true);
+    push_val<size_t>(buf, 1); // nlist
+    push_val<size_t>(buf, 1); // nprobe
+    push_fourcc(buf, "null"); // coarse quantizer -> read_index returns nullptr
+    push_empty_direct_map(buf);
+    // IVFPQ body: by_residual, code_size, ProductQuantizer, inverted lists.
+    push_val<bool>(buf, true); // by_residual
+    push_val<size_t>(buf, 1);  // code_size
+    // Valid PQ: d=4, M=1, nbits=8 -> ksub=256, centroids = d*ksub = 1024.
+    push_pq(buf,
+            /*d=*/4,
+            /*M=*/1,
+            /*nbits=*/8,
+            std::vector<float>(4 * 256, 0.0f));
+    push_null_invlists(buf);
+
+    expect_read_throws_with(buf, "IVFPQ coarse quantizer is null");
+}
+
+// -----------------------------------------------------------------------
+// Test: the precompute-table bound also covers the type-2 table used when the
+// coarse quantizer is a MultiIndexQuantizer. That table is
+// cpq.ksub * pq.M * pq.ksub floats, driven by the coarse PQ's ksub, which is
+// decoupled from quantizer->ntotal. A crafted MultiIndexQuantizer with a tiny
+// ntotal but a large ksub passes an ntotal-only bound yet forces a huge
+// allocation, so the guard must reject it.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize,
+     IVFPQMultiIndexQuantizerPrecomputedTableExceedsByteLimit) {
+    const int d = 8;
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IwPQ");
+    push_index_header(buf, d, /*ntotal=*/0, /*is_trained=*/true);
+    push_val<size_t>(buf, 1); // nlist
+    push_val<size_t>(buf, 1); // nprobe
+    // Coarse quantizer = MultiIndexQuantizer ("Imiq") with a crafted tiny
+    // ntotal(1) but cpq.nbits=10 -> cpq.ksub=1024, decoupling the type-2 table
+    // size from ntotal.
+    push_fourcc(buf, "Imiq");
+    push_index_header(buf, d, /*ntotal=*/1, /*is_trained=*/true);
+    push_pq(buf, d, /*M=*/1, /*nbits=*/10, std::vector<float>(d * 1024, 0.0f));
+    push_empty_direct_map(buf);
+    push_val<bool>(buf, true); // by_residual
+    push_val<size_t>(buf, 1);  // code_size
+    // Outer PQ: M=2, nbits=8 -> ksub=256, m_ksub=512, and pq.M % cpq.M == 0.
+    push_pq(buf, d, /*M=*/2, /*nbits=*/8, std::vector<float>(d * 256, 0.0f));
+    push_null_invlists(buf);
+
+    const size_t old_limit = get_deserialization_vector_byte_limit();
+    set_deserialization_vector_byte_limit(size_t{1} << 16); // 64 KB
+    // type-1 bound: ntotal(1) * 2 * 256 = 512 floats -- an ntotal-only guard
+    // would pass. type-2 table: cpq.ksub(1024) * 2 * 256 = 524288 floats --
+    // must be rejected.
+    expect_read_throws_with(buf, "precomputed_table");
+    set_deserialization_vector_byte_limit(old_limit);
+}
+
+// -----------------------------------------------------------------------
+// Test: the IVFPQFastScan (IwPf) read path also rejects a null coarse quantizer
+// at the explicit check right after read_ivf_header, before any
+// quantizer->ntotal dereference.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IVFPQFastScanNullQuantizerReadRejected) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IwPf");
+    push_index_header(buf, /*d=*/4, /*ntotal=*/0, /*is_trained=*/true);
+    push_val<size_t>(buf, 1); // nlist
+    push_val<size_t>(buf, 1); // nprobe
+    push_fourcc(buf, "null"); // coarse quantizer -> read_index returns nullptr
+    push_empty_direct_map(buf);
+
+    expect_read_throws_with(buf, "IVFPQFastScan coarse quantizer is null");
+}
+
 // ============================================================
 // SVS fourcc rejection / deserialization safety (Group F: T262015608)
 // ============================================================
@@ -4024,6 +4356,7 @@ TEST(ReadIndexDeserialize, SVSVamanaInvalidStreamThrows) {
     push_val<size_t>(buf, 28);  // prune_to
     push_val<bool>(buf, false); // use_full_search_history
     push_val<int>(buf, 0);      // storage_kind (SVS_Float16)
+    push_val<bool>(buf, false); // is_static
     push_val<bool>(buf, true); // initialized = true → triggers deserialize_impl
     // Provide garbage SVS stream data — load should fail gracefully.
     for (int i = 0; i < 256; i++) {
@@ -4058,6 +4391,73 @@ TEST(ReadIndexDeserialize, SVSFlatInvalidStreamThrows) {
                 faiss::read_index(&reader);
             },
             faiss::FaissException);
+}
+
+// -----------------------------------------------------------------------
+// Tests: SVS DirectoryArchiver entry validation.
+//
+// An "ISVF" payload carrying DirectoryArchiver::magic_number is unpacked by
+// the vendored SVS archiver, which reads the entry name length, the entry
+// name, and the entry size straight off the stream. All three are
+// attacker-controlled and are consumed before any FAISS-side validation runs
+// — the ReaderStreambuf byte limit only bounds individual reads, so it
+// cannot police either the name length or the resulting path.
+// -----------------------------------------------------------------------
+
+/// DirectoryArchiver::magic_number, from
+/// third-party/svs/v0.4.0/src/include/svs/lib/file.h.
+static constexpr uint64_t kSvsDirectoryArchiverMagic = 0x5e2d58d9f3b4a6c1ULL;
+
+/// Append an "ISVF" index that routes into DirectoryArchiver::unpack carrying
+/// a single archive entry. `declared_name_len` is written to the stream as the
+/// entry's name length and is deliberately separate from `filename` so that a
+/// test can claim a length it does not supply.
+static void push_svs_flat_archive_entry(
+        std::vector<uint8_t>& buf,
+        const std::string& filename,
+        uint64_t declared_name_len,
+        const std::vector<uint8_t>& contents = {}) {
+    push_fourcc(buf, "ISVF");
+    push_index_header(buf, 8, 0);
+    push_val<bool>(buf, true); // initialized -> enters deserialize_impl
+    push_val<uint64_t>(buf, kSvsDirectoryArchiverMagic);
+    push_val<uint64_t>(buf, uint64_t(1)); // num_files
+    push_val<uint64_t>(buf, declared_name_len);
+    buf.insert(buf.end(), filename.begin(), filename.end());
+    push_val<uint64_t>(buf, uint64_t(contents.size()));
+    buf.insert(buf.end(), contents.begin(), contents.end());
+}
+
+// An absolute entry name must not escape the archiver's temp root.
+// std::filesystem::operator/ discards its left operand entirely when the right
+// operand is absolute, so `root / filename` collapses to `filename`.
+TEST(ReadIndexDeserialize, SVSArchiveAbsolutePathEntryRejected) {
+    const auto probe = std::filesystem::temp_directory_path() /
+            "faiss_svs_archive_absolute_probe";
+    std::filesystem::remove(probe);
+
+    const std::string filename = probe.string();
+    std::vector<uint8_t> buf;
+    push_svs_flat_archive_entry(buf, filename, filename.size(), {'x'});
+
+    expect_read_throws_with(buf, "escapes the extraction root");
+    EXPECT_FALSE(std::filesystem::exists(probe));
+}
+
+// Same, for a relative entry name that climbs out of the temp root. The
+// archiver unpacks into temp_directory_path()/svs_flat_load-<uuid>, so a
+// single ".." lands back in temp_directory_path().
+TEST(ReadIndexDeserialize, SVSArchiveParentTraversalEntryRejected) {
+    const auto probe = std::filesystem::temp_directory_path() /
+            "faiss_svs_archive_traversal_probe";
+    std::filesystem::remove(probe);
+
+    const std::string filename = "../faiss_svs_archive_traversal_probe";
+    std::vector<uint8_t> buf;
+    push_svs_flat_archive_entry(buf, filename, filename.size(), {'x'});
+
+    expect_read_throws_with(buf, "escapes the extraction root");
+    EXPECT_FALSE(std::filesystem::exists(probe));
 }
 
 // -----------------------------------------------------------------------
@@ -4314,6 +4714,58 @@ TEST(ReadIndexDeserialize, IndexBinaryIDMap2InnerNtotalMismatchRejected) {
     expect_binary_read_throws_with(buf, "inner index ntotal");
 }
 
+// -----------------------------------------------------------------------
+// IndexIDMap with a "null" sub-index fourcc.  read_index returns
+// nullptr for that fourcc, so the inner-ntotal cross-check on the
+// IxMp/IxM2 path would dereference idxmap->index without protection.
+// Verify both float variants reject the payload at the new "inner
+// index is null" guard rather than crashing inside the validator.
+// The binary IBMp/IBM2 path is reached indirectly (an embedded float
+// IxMp/IxM2 inside a binary wrapper such as IndexBinaryFromFloat); it
+// is covered by the same float-side guard exercised here.
+// -----------------------------------------------------------------------
+
+namespace {
+
+std::vector<uint8_t> make_idmap_null_inner_payload(const char fourcc[4]) {
+    constexpr int d = 4;
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, fourcc);
+    push_index_header(buf, d, /*ntotal=*/0);
+    push_fourcc(buf, "null");
+    push_vector<int64_t>(buf, std::vector<int64_t>{});
+    return buf;
+}
+
+} // namespace
+
+TEST(ReadIndexDeserialize, IndexIDMapNullInnerRejected) {
+    auto buf = make_idmap_null_inner_payload("IxMp");
+    expect_read_throws_with(buf, "inner index is null");
+}
+
+TEST(ReadIndexDeserialize, IndexIDMap2NullInnerRejected) {
+    auto buf = make_idmap_null_inner_payload("IxM2");
+    expect_read_throws_with(buf, "inner index is null");
+}
+
+// -----------------------------------------------------------------------
+// IndexBinaryFromFloat ("IBFf") wraps an inner float index.  read_index
+// returns nullptr for the "null" sub-index fourcc, and the IBFf
+// deserialize site previously accepted it without validation -- the
+// resulting IndexBinaryFromFloat would null-deref on the first
+// search/add operation rather than at the deserialization boundary.
+// Verify the new guard rejects the payload up front.
+// -----------------------------------------------------------------------
+TEST(ReadIndexDeserialize, IndexBinaryFromFloatNullInnerRejected) {
+    constexpr int d = 8;
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IBFf");
+    push_binary_index_header(buf, d, /*ntotal=*/0);
+    push_fourcc(buf, "null");
+    expect_binary_read_throws_with(buf, "inner index is null");
+}
+
 // A well-formed IxMp payload with matching ntotals deserializes cleanly.
 TEST(ReadIndexDeserialize, IndexIDMapMatchingNtotalsAccepted) {
     auto buf = make_idmap_payload(
@@ -4353,4 +4805,271 @@ TEST(IndexIDMapSafety, SearchRemapsOutOfRangeLabelsToSentinel) {
     EXPECT_NO_THROW(
             idmap.search(1, xq.data(), 1, distances.data(), labels.data()));
     EXPECT_EQ(labels[0], -1);
+}
+
+// -----------------------------------------------------------------------
+// Panorama deserialization and reconstruct bounds (T287094917).
+//
+// "IxFP"/"IxFp" format: fourcc + d(int) + n_levels + batch_size +
+// ntotal(int64) + is_trained(bool) + codes vec + cum_sums vec.
+// Unlike every other index type this branch does not go through
+// read_index_header, so its own range checks are all that guard d and
+// ntotal.
+// -----------------------------------------------------------------------
+static void push_flat_panorama(
+        std::vector<uint8_t>& buf,
+        int d,
+        size_t n_levels,
+        size_t batch_size,
+        int64_t ntotal,
+        size_t codes_bytes,
+        size_t cum_sums_count) {
+    push_fourcc(buf, "IxFP");
+    push_val<int>(buf, d);
+    push_val<size_t>(buf, n_levels);
+    push_val<size_t>(buf, batch_size);
+    push_val<int64_t>(buf, ntotal);
+    push_val<bool>(buf, true);
+    push_val<size_t>(buf, codes_bytes);
+    buf.resize(buf.size() + codes_bytes, 0);
+    push_val<size_t>(buf, cum_sums_count);
+    buf.resize(buf.size() + cum_sums_count * sizeof(float), 0);
+}
+
+// A d large enough to make code_size = d * 4 overflow into gigabytes must
+// be rejected at read time, as it is for every other index type.
+TEST(ReadIndexDeserialize, FlatPanoramaDimensionOutOfRange) {
+    std::vector<uint8_t> buf;
+    push_flat_panorama(
+            buf,
+            /*d=*/1280725833,
+            /*n_levels=*/1,
+            /*batch_size=*/1024,
+            /*ntotal=*/0,
+            /*codes_bytes=*/0,
+            /*cum_sums_count=*/0);
+
+    expect_read_throws_with(buf, "out of range");
+}
+
+TEST(ReadIndexDeserialize, FlatPanoramaNegativeNtotal) {
+    std::vector<uint8_t> buf;
+    push_flat_panorama(
+            buf,
+            /*d=*/8,
+            /*n_levels=*/1,
+            /*batch_size=*/4,
+            /*ntotal=*/-1,
+            /*codes_bytes=*/0,
+            /*cum_sums_count=*/0);
+
+    expect_read_throws_with(buf, "invalid ntotal");
+}
+
+TEST(ReadIndexDeserialize, FlatPanoramaZeroBatchSizeRejected) {
+    std::vector<uint8_t> buf;
+    push_flat_panorama(
+            buf,
+            /*d=*/8,
+            /*n_levels=*/1,
+            /*batch_size=*/0,
+            /*ntotal=*/2,
+            /*codes_bytes=*/0,
+            /*cum_sums_count=*/0);
+
+    expect_read_throws_with(buf, "invalid IxFP batch_size");
+}
+
+TEST(ReadIndexDeserialize, FlatPanoramaCodesSizeOverflowRejected) {
+    std::vector<uint8_t> buf;
+    push_flat_panorama(
+            buf,
+            /*d=*/8,
+            /*n_levels=*/1,
+            /*batch_size=*/(std::numeric_limits<size_t>::max)(),
+            /*ntotal=*/2,
+            /*codes_bytes=*/0,
+            /*cum_sums_count=*/0);
+
+    // With batch_size=SIZE_MAX and ntotal=2, num_batches computes to 1 and
+    // num_slots=1*SIZE_MAX does not overflow. The throw actually originates
+    // from the later num_slots * code_size multiplication in mul_no_overflow,
+    // which emits "integer overflow in IndexFlatPanorama codes: ...". Match
+    // on that full prefix so this test cannot be silently satisfied by the
+    // sibling "IndexFlatPanorama codes size mismatch" throw.
+    expect_read_throws_with(buf, "integer overflow in IndexFlatPanorama codes");
+}
+
+TEST(ReadIndexDeserialize, FlatPanoramaCodesSizeMismatch) {
+    std::vector<uint8_t> buf;
+    push_flat_panorama(
+            buf,
+            /*d=*/8,
+            /*n_levels=*/1,
+            /*batch_size=*/4,
+            /*ntotal=*/2,
+            /*codes_bytes=*/0,
+            /*cum_sums_count=*/0);
+
+    // Match on the explicit FAISS_THROW_IF_NOT_FMT message so the test is
+    // pinned to the intended error rather than a stringified condition
+    // expression that would break on trivial refactors.
+    expect_read_throws_with(buf, "IndexFlatPanorama codes size mismatch");
+}
+
+// End-to-end shape of the fuzzer crash: an IndexPreTransform with an empty
+// chain wrapping an empty IndexFlatPanorama. Everything deserializes, and
+// reconstruct() must then reject the out-of-range key instead of memcpy'ing
+// code_size bytes out of a zero-length codes buffer.
+TEST(ReadIndexDeserialize, PreTransformOverEmptyFlatPanoramaReconstruct) {
+    constexpr int d = 8;
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IxPT");
+    push_index_header(buf, d, /*ntotal=*/0);
+    push_val<int>(buf, 0); // nt = 0, empty chain
+    push_flat_panorama(
+            buf,
+            d,
+            /*n_levels=*/1,
+            /*batch_size=*/4,
+            /*ntotal=*/0,
+            /*codes_bytes=*/0,
+            /*cum_sums_count=*/0);
+
+    VectorIOReader reader;
+    reader.data = buf;
+    std::unique_ptr<Index> idx;
+    ASSERT_NO_THROW({ idx = read_index_up(&reader); });
+    ASSERT_NE(idx, nullptr);
+
+    std::vector<float> recons(d, 0.0f);
+    EXPECT_THROW(idx->reconstruct(0, recons.data()), FaissException);
+}
+
+// "IHfP" format: fourcc + index_header + n_levels(size_t) + cum_sums vec +
+// HNSW graph + storage index. cum_sums must hold ntotal * (n_levels + 1)
+// floats; a short vector is an out-of-bounds read on the search path.
+TEST(ReadIndexDeserialize, HNSWFlatPanoramaCumSumsSizeMismatch) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IHfP");
+    push_index_header(buf, /*d=*/4, /*ntotal=*/1);
+    push_val<size_t>(buf, size_t(1)); // n_levels
+    push_vector<float>(buf, {0.0f});  // cum_sums: 1 float, needs 2
+
+    expect_read_throws_with(buf, "IndexHNSWFlatPanorama cum_sums");
+}
+
+TEST(ReadIndexDeserialize, HNSWFlatPanoramaZeroLevels) {
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IHfP");
+    push_index_header(buf, /*d=*/4, /*ntotal=*/0);
+    push_val<size_t>(buf, size_t(0)); // n_levels = 0
+
+    expect_read_throws_with(buf, "invalid IHfP n_levels");
+}
+
+// IndexFlatPanorama overrides reconstruct()/reconstruct_n() and so does not
+// inherit the range guards in IndexFlat / IndexFlatCodes. Panorama's
+// level-major layout means an out-of-range key reads whole batch strides
+// past the end of `codes`.
+TEST(IndexFlatPanoramaSafety, ReconstructRejectsOutOfRangeKey) {
+    constexpr int d = 8;
+    IndexFlatL2Panorama index(d, /*n_levels_in=*/2, /*batch_size_in=*/4);
+    std::vector<float> recons(2 * d, 0.0f);
+
+    EXPECT_THROW(index.reconstruct(0, recons.data()), FaissException);
+
+    std::vector<float> xb(2 * d, 1.0f);
+    index.add(2, xb.data());
+
+    EXPECT_NO_THROW(index.reconstruct(1, recons.data()));
+    EXPECT_THROW(index.reconstruct(2, recons.data()), FaissException);
+    EXPECT_THROW(index.reconstruct(-1, recons.data()), FaissException);
+    EXPECT_NO_THROW(index.reconstruct_n(0, 2, recons.data()));
+    EXPECT_THROW(index.reconstruct_n(-1, 1, recons.data()), FaissException);
+    EXPECT_THROW(index.reconstruct_n(0, -1, recons.data()), FaissException);
+    EXPECT_THROW(
+            index.reconstruct_n(
+                    1, (std::numeric_limits<idx_t>::max)(), recons.data()),
+            FaissException);
+    EXPECT_THROW(index.reconstruct_n(1, 2, recons.data()), FaissException);
+    EXPECT_THROW(index.reconstruct_n(-1, 0, recons.data()), FaissException);
+    EXPECT_THROW(index.reconstruct_n(3, 0, recons.data()), FaissException);
+}
+
+namespace {
+
+constexpr size_t kTurboQFullDimension = 16;
+constexpr uint64_t kTurboQFullSeed = 0x0123456789abcdefULL;
+constexpr auto kTurboQFullQtype = ScalarQuantizer::QT_3bit_tq;
+
+// Total TurboQ bits/component for a QT_*_tq qtype (matches the mapping in
+// ScalarQuantizer::set_derived_sizes). Full TurboQ splits these into
+// (bits - 1) MSE bits + 1 QJL bit, so the reader-side trained-vector
+// centroid count is k = 1 << (bits - 1).
+constexpr size_t turboq_full_nb_bits(ScalarQuantizer::QuantizerType qt) {
+    return qt == ScalarQuantizer::QT_2bit_tq    ? 2
+            : qt == ScalarQuantizer::QT_3bit_tq ? 3
+            : qt == ScalarQuantizer::QT_4bit_tq ? 4
+            : qt == ScalarQuantizer::QT_5bit_tq ? 5
+                                                : 0;
+}
+
+// Derived rather than hardcoded so that changing kTurboQFullQtype (e.g. to
+// QT_4bit_tq) automatically resizes the payload; hardcoding kept the two
+// constants coupled and a mismatch would fail the read for an unrelated
+// reason (trained.size() != k + (k-1) + 3).
+//
+// `turboq_full_nb_bits` returns 0 for qtypes it does not recognise; guard
+// against that sentinel here so a future change to `kTurboQFullQtype` that
+// forgets to extend the mapping fails loudly at compile time instead of
+// tripping UB via `size_t{1} << (0 - 1)`.
+static_assert(
+        turboq_full_nb_bits(kTurboQFullQtype) != 0,
+        "kTurboQFullQtype must be a QT_*_tq qtype recognised by "
+        "turboq_full_nb_bits; extend the mapping when adding new tq qtypes.");
+constexpr size_t kTurboQFullCentroids = size_t{1}
+        << (turboq_full_nb_bits(kTurboQFullQtype) - 1);
+
+std::vector<uint8_t> make_turboq_full_sq_payload(
+        uint8_t qjl_type,
+        size_t d = kTurboQFullDimension) {
+    float seed[2];
+    ScalarQuantizer::TurboQuantRefine::pack_seed(kTurboQFullSeed, seed);
+    std::vector<float> trained(
+            kTurboQFullCentroids + (kTurboQFullCentroids - 1) + 3, 0.0f);
+    trained[trained.size() - 3] = seed[0];
+    trained[trained.size() - 2] = seed[1];
+    trained[trained.size() - 1] = static_cast<float>(qjl_type);
+
+    std::vector<uint8_t> buf;
+    push_fourcc(buf, "IxSQ");
+    push_index_header(buf, static_cast<int>(d), /*ntotal=*/0);
+    push_val<int>(buf, kTurboQFullQtype);
+    push_val<int>(buf, 0);      // rangestat
+    push_val<float>(buf, 0.0f); // rangestat_arg
+    push_val<size_t>(buf, d);
+    push_val<size_t>(buf, 0); // code_size is recomputed on read
+    push_vector<float>(buf, trained);
+    push_vector<uint8_t>(buf, {}); // codes
+    return buf;
+}
+
+} // namespace
+
+TEST(ReadIndexDeserialize, SQTurboQuantFullRecoversConfigFromTrained) {
+    for (const uint8_t qjl_type : {uint8_t{0}, uint8_t{2}}) {
+        SCOPED_TRACE(testing::Message() << "qjl_type = " << int(qjl_type));
+
+        VectorIOReader reader;
+        reader.data = make_turboq_full_sq_payload(qjl_type);
+        std::unique_ptr<Index> index;
+        ASSERT_NO_THROW(index = read_index_up(&reader));
+
+        const auto* sq_index = dynamic_cast<IndexScalarQuantizer*>(index.get());
+        ASSERT_NE(sq_index, nullptr);
+        EXPECT_EQ(sq_index->sq.d, kTurboQFullDimension);
+        EXPECT_EQ(sq_index->sq.turboq_refine.qjl_type, qjl_type);
+        EXPECT_EQ(sq_index->sq.turboq_refine.seed, kTurboQFullSeed);
+    }
 }

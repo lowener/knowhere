@@ -17,6 +17,7 @@
 #include "knowhere/comp/index_param.h"
 #include "knowhere/comp/knowhere_check.h"
 #include "knowhere/index/index_factory.h"
+#include "simd/hook.h"
 
 using namespace knowhere;
 
@@ -146,6 +147,16 @@ TEST_CASE("Test index and data type check", "[IndexCheckTest]") {
         CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_VAMANA_LEANVEC, VecType::VECTOR_BFLOAT16));
         CHECK_FALSE(
             KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_VAMANA_LEANVEC, VecType::VECTOR_BINARY));
+
+        CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_FLOAT));
+        CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_FLOAT16));
+        CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_BFLOAT16));
+        CHECK_FALSE(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_BINARY));
+
+        CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_FLOAT));
+        CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_FLOAT16));
+        CHECK(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_BFLOAT16));
+        CHECK_FALSE(KnowhereCheck::IndexTypeAndDataTypeCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_BINARY));
 #endif
 
         // sparse index
@@ -222,7 +233,9 @@ TEST_CASE("Test index has raw data", "[IndexHasRawData]") {
         CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_IVFFLAT, ver, {}));
         CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_IVFFLAT_CC, ver, {}));
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_IVFPQ, ver, {}));
-        CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, {}));
+        if (faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+            CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, {}));
+        }
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_IVFSQ8, ver, {}));
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_IVFSQ_CC, ver, {}));
 
@@ -254,6 +267,8 @@ TEST_CASE("Test index has raw data", "[IndexHasRawData]") {
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_SVS_VAMANA, ver, {}));
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_SVS_VAMANA_LVQ, ver, {}));
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_SVS_VAMANA_LEANVEC, ver, {}));
+        CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_SVS_IVF, ver, {}));
+        CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_SVS_IVF_LEANVEC, ver, {}));
 #endif
 
         // gpu index
@@ -279,16 +294,18 @@ TEST_CASE("Test index has raw data", "[IndexHasRawData]") {
 
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(
             IndexEnum::INDEX_FAISS_IDMAP, min_ver, knowhere::Json::parse(R"({"metric_type": "COSINE"})")));
-        CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
+        if (faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+            CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
 
-        json[indexparam::WITH_RAW_DATA] = false;
-        CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
-        json[indexparam::WITH_RAW_DATA] = "true";
-        CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
-        json[indexparam::WITH_RAW_DATA] = "false";
-        CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
-        json[indexparam::WITH_RAW_DATA] = 1;
-        CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
+            json[indexparam::WITH_RAW_DATA] = false;
+            CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
+            json[indexparam::WITH_RAW_DATA] = "true";
+            CHECK(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
+            json[indexparam::WITH_RAW_DATA] = "false";
+            CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
+            json[indexparam::WITH_RAW_DATA] = 1;
+            CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_FAISS_SCANN, ver, json));
+        }
 
         knowhere::Json faiss_hnsw_cfg = {{"refine", true}, {"refine_type", "bf16"}};
         CHECK_FALSE(knowhere::IndexStaticFaced<fp32>::HasRawData(IndexEnum::INDEX_HNSW_SQ, ver, faiss_hnsw_cfg));
@@ -333,6 +350,8 @@ TEST_CASE("Test index feature check", "[IndexFeatureCheck]") {
         REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_VAMANA_LVQ, knowhere::feature::MMAP));
         REQUIRE_FALSE(
             IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_VAMANA_LEANVEC, knowhere::feature::MMAP));
+        REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::MMAP));
+        REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::MMAP));
 #endif
 #ifdef KNOWHERE_WITH_CUVS
         REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_CUVS_BRUTEFORCE, knowhere::feature::MMAP));
@@ -375,6 +394,8 @@ TEST_CASE("Test index feature check", "[IndexFeatureCheck]") {
         REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_VAMANA_LVQ, knowhere::feature::GPU));
         REQUIRE_FALSE(
             IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_VAMANA_LEANVEC, knowhere::feature::GPU));
+        REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::GPU));
+        REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::GPU));
 #endif
     }
 
@@ -554,6 +575,21 @@ TEST_CASE("Test index feature check", "[IndexFeatureCheck]") {
             IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_VAMANA_LEANVEC, knowhere::feature::BINARY));
         REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_VAMANA_LEANVEC,
                                                             knowhere::feature::SPARSE_U32_F32));
+
+        REQUIRE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::FLOAT32));
+        REQUIRE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::FP16));
+        REQUIRE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::BF16));
+        REQUIRE_FALSE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::BINARY));
+        REQUIRE_FALSE(
+            IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF, knowhere::feature::SPARSE_U32_F32));
+
+        REQUIRE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::FLOAT32));
+        REQUIRE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::FP16));
+        REQUIRE(IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::BF16));
+        REQUIRE_FALSE(
+            IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::BINARY));
+        REQUIRE_FALSE(
+            IndexFactory::Instance().FeatureCheck(IndexEnum::INDEX_SVS_IVF_LEANVEC, knowhere::feature::SPARSE_U32_F32));
 #endif
     }
 

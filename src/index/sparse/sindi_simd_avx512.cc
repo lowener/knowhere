@@ -5,11 +5,13 @@
 
 namespace knowhere::sparse::inverted::sindi {
 
-void
-ip_scatter_avx512_fp16(float qval, const knowhere::fp16* vals, const uint16_t* ids, int32_t num, float* out) {
+float
+ip_accumulate_avx512_fp16(float qval, const knowhere::fp16* vals, const uint16_t* ids, int32_t num, float* out) {
     int32_t i = 0;
     const __m512 vq512 = _mm512_set1_ps(qval);
     const __m256 vq256 = _mm256_set1_ps(qval);
+    __m512 v_max = _mm512_setzero_ps();
+    __m256 v_max256 = _mm256_setzero_ps();
     for (; i + 16 <= num; i += 16) {
         const uint16_t* hptr = reinterpret_cast<const uint16_t*>(vals + i);
         __m256i h = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(hptr));
@@ -21,6 +23,7 @@ ip_scatter_avx512_fp16(float qval, const knowhere::fp16* vals, const uint16_t* i
         __m512 v_old = _mm512_i32gather_ps(v_idx, out, 4);
         __m512 v_sum = _mm512_add_ps(v_old, v_mul);
         _mm512_i32scatter_ps(out, v_idx, v_sum, 4);
+        v_max = _mm512_max_ps(v_max, v_sum);
     }
     for (; i + 8 <= num; i += 8) {
         const uint16_t* hptr = reinterpret_cast<const uint16_t*>(vals + i);
@@ -32,15 +35,28 @@ ip_scatter_avx512_fp16(float qval, const knowhere::fp16* vals, const uint16_t* i
         __m256 v_old = _mm256_i32gather_ps(out, v_idx, 4);
         __m256 v_sum = _mm256_add_ps(v_old, v_mul);
         _mm256_i32scatter_ps(out, v_idx, v_sum, 4);
+        v_max256 = _mm256_max_ps(v_max256, v_sum);
+    }
+    float max_val = _mm512_reduce_max_ps(v_max);
+    __m128 v_max128 = _mm_max_ps(_mm256_castps256_ps128(v_max256), _mm256_extractf128_ps(v_max256, 1));
+    v_max128 = _mm_max_ps(v_max128, _mm_shuffle_ps(v_max128, v_max128, _MM_SHUFFLE(2, 3, 0, 1)));
+    v_max128 = _mm_max_ps(v_max128, _mm_shuffle_ps(v_max128, v_max128, _MM_SHUFFLE(1, 0, 3, 2)));
+    float max256_scalar = _mm_cvtss_f32(v_max128);
+    if (max256_scalar > max_val) {
+        max_val = max256_scalar;
     }
     for (; i < num; ++i) {
-        out[ids[i]] += qval * static_cast<float>(vals[i]);
+        float new_val = (out[ids[i]] += qval * static_cast<float>(vals[i]));
+        if (new_val > max_val) {
+            max_val = new_val;
+        }
     }
+    return max_val;
 }
 
-void
-bm25_scatter_avx512_u16(float qval, const uint16_t* vals, const uint16_t* ids, int32_t num, float* out, float k1,
-                        float b, float avgdl, const float* row_sums) {
+float
+bm25_accumulate_avx512_u16(float qval, const uint16_t* vals, const uint16_t* ids, int32_t num, float* out, float k1,
+                           float b, float avgdl, const float* row_sums) {
     const float p1 = k1 + 1.0f;
     const float p2 = k1 * (1.0f - b);
     const float p3 = k1 * b / avgdl;
@@ -50,6 +66,7 @@ bm25_scatter_avx512_u16(float qval, const uint16_t* vals, const uint16_t* ids, i
     const __m512 vp1 = _mm512_set1_ps(p1);
     const __m512 vp2 = _mm512_set1_ps(p2);
     const __m512 vp3 = _mm512_set1_ps(p3);
+    __m512 v_max = _mm512_setzero_ps();
 
     for (; i + 16 <= num; i += 16) {
         const uint16_t* hptr = vals + i;
@@ -74,15 +91,69 @@ bm25_scatter_avx512_u16(float qval, const uint16_t* vals, const uint16_t* ids, i
         __m512 v_old = _mm512_i32gather_ps(v_idx, out, 4);
         __m512 v_sum = _mm512_add_ps(v_old, bm25_vec);
         _mm512_i32scatter_ps(out, v_idx, v_sum, 4);
+        v_max = _mm512_max_ps(v_max, v_sum);
     }
+
+    float max_val = _mm512_reduce_max_ps(v_max);
 
     for (; i < num; ++i) {
         float tf = static_cast<float>(vals[i]);
         uint16_t docid = ids[i];
         float dl = row_sums[docid];
         float bm25_score = qval * p1 * tf / (tf + p2 + p3 * dl);
-        out[docid] += bm25_score;
+        float new_val = (out[docid] += bm25_score);
+        if (new_val > max_val) {
+            max_val = new_val;
+        }
     }
+    return max_val;
+}
+
+float
+bm25_accumulate_avx512_u8(float qval, const uint8_t* vals, const uint16_t* ids, int32_t num, float* out, float k1,
+                          float b, float avgdl, const float* row_sums) {
+    const float p1 = k1 + 1.0f;
+    const float p2 = k1 * (1.0f - b);
+    const float p3 = k1 * b / avgdl;
+
+    int32_t i = 0;
+    const __m512 vqp1 = _mm512_set1_ps(qval * p1);
+    const __m512 vp2 = _mm512_set1_ps(p2);
+    const __m512 vp3 = _mm512_set1_ps(p3);
+    __m512 v_max = _mm512_setzero_ps();
+
+    for (; i + 16 <= num; i += 16) {
+        __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(vals + i));
+        __m512i words = _mm512_cvtepu8_epi32(bytes);
+        __m512 tf_vec = _mm512_cvtepi32_ps(words);
+
+        __m256i idx16 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ids + i));
+        __m512i v_idx = _mm512_cvtepu16_epi32(idx16);
+        __m512 dl_vec = _mm512_i32gather_ps(v_idx, row_sums, 4);
+
+        __m512 numerator = _mm512_mul_ps(tf_vec, vqp1);
+        __m512 denominator = _mm512_fmadd_ps(dl_vec, vp3, vp2);
+        denominator = _mm512_add_ps(tf_vec, denominator);
+        __m512 bm25_vec = _mm512_div_ps(numerator, denominator);
+
+        __m512 v_old = _mm512_i32gather_ps(v_idx, out, 4);
+        __m512 v_sum = _mm512_add_ps(v_old, bm25_vec);
+        _mm512_i32scatter_ps(out, v_idx, v_sum, 4);
+        v_max = _mm512_max_ps(v_max, v_sum);
+    }
+
+    float max_val = _mm512_reduce_max_ps(v_max);
+    for (; i < num; ++i) {
+        float tf = static_cast<float>(vals[i]);
+        uint16_t docid = ids[i];
+        float dl = row_sums[docid];
+        float bm25_score = qval * p1 * tf / (tf + p2 + p3 * dl);
+        float new_val = (out[docid] += bm25_score);
+        if (new_val > max_val) {
+            max_val = new_val;
+        }
+    }
+    return max_val;
 }
 
 void

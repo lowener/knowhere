@@ -538,18 +538,20 @@ TEST_F(HNSWTest, TEST_search_from_candidate_unbounded) {
     auto nearest = index->hnsw.entry_point;
     float d_nearest = (*dis)(nearest);
     auto node = faiss::HNSW::Node(d_nearest, nearest);
-    faiss::VisitedTable vt(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> vt =
+            faiss::VisitedTable::create(index->ntotal);
     faiss::HNSWStats stats;
 
     // actual version
-    auto top_candidates = faiss::search_from_candidate_unbounded(
-            index->hnsw, node, *dis, k, &vt, stats);
+    auto top_candidates = faiss::hnsw_detail::search_from_candidate_unbounded(
+            index->hnsw, node, *dis, k, vt.get(), stats);
 
     auto reference_nearest = index->hnsw.entry_point;
     float reference_d_nearest = (*dis)(nearest);
     auto reference_node =
             faiss::HNSW::Node(reference_d_nearest, reference_nearest);
-    faiss::VisitedTable reference_vt(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> reference_vt =
+            faiss::VisitedTable::create(index->ntotal);
     faiss::HNSWStats reference_stats;
 
     // reference version
@@ -558,7 +560,7 @@ TEST_F(HNSWTest, TEST_search_from_candidate_unbounded) {
             reference_node,
             *dis,
             k,
-            &reference_vt,
+            reference_vt.get(),
             reference_stats);
     EXPECT_EQ(stats.ndis, reference_stats.ndis);
     EXPECT_EQ(stats.nhops, reference_stats.nhops);
@@ -576,7 +578,7 @@ TEST_F(HNSWTest, TEST_greedy_update_nearest) {
     float reference_d_nearest = (*dis)(reference_nearest);
 
     // actual version
-    auto stats = faiss::greedy_update_nearest(
+    auto stats = faiss::hnsw_detail::greedy_update_nearest(
             index->hnsw, *dis, 0, nearest, d_nearest);
 
     // reference version
@@ -599,15 +601,17 @@ TEST_F(HNSWTest, TEST_search_from_candidates) {
     std::vector<float> reference_D(k * nq);
     using RH = faiss::HeapBlockResultHandler<faiss::HNSW::C>;
 
-    faiss::VisitedTable vt(index->ntotal);
-    faiss::VisitedTable reference_vt(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> vt =
+            faiss::VisitedTable::create(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> reference_vt =
+            faiss::VisitedTable::create(index->ntotal);
     int num_candidates = 10;
     faiss::MinimaxHeap candidates(num_candidates);
     faiss::MinimaxHeap reference_candidates(num_candidates);
 
     for (int i = 0; i < num_candidates; i++) {
-        vt.set(i);
-        reference_vt.set(i);
+        vt->set(i);
+        reference_vt->set(i);
         candidates.push(i, (*dis)(i));
         reference_candidates.push(i, (*dis)(i));
     }
@@ -618,8 +622,8 @@ TEST_F(HNSWTest, TEST_search_from_candidates) {
             bres);
 
     res.begin(0);
-    faiss::search_from_candidates(
-            index->hnsw, *dis, res, candidates, vt, stats, 0, 0, nullptr);
+    faiss::hnsw_detail::search_from_candidates(
+            index->hnsw, *dis, res, candidates, *vt, stats, 0, 0, nullptr);
     res.end();
 
     faiss::HNSWStats reference_stats;
@@ -632,7 +636,7 @@ TEST_F(HNSWTest, TEST_search_from_candidates) {
             *dis,
             reference_res,
             reference_candidates,
-            reference_vt,
+            *reference_vt,
             reference_stats,
             0,
             0,
@@ -653,30 +657,32 @@ TEST_F(HNSWTest, TEST_search_from_candidates) {
 TEST_F(HNSWTest, TEST_search_neighbors_to_add) {
     omp_set_num_threads(1);
 
-    faiss::VisitedTable vt(index->ntotal);
-    faiss::VisitedTable reference_vt(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> vt =
+            faiss::VisitedTable::create(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> reference_vt =
+            faiss::VisitedTable::create(index->ntotal);
 
     std::priority_queue<faiss::HNSW::NodeDistCloser> link_targets;
     std::priority_queue<faiss::HNSW::NodeDistCloser> reference_link_targets;
 
-    faiss::search_neighbors_to_add(
+    faiss::hnsw_detail::search_neighbors_to_add(
             index->hnsw,
             *dis,
             link_targets,
             index->hnsw.entry_point,
             (*dis)(index->hnsw.entry_point),
             index->hnsw.max_level,
-            vt,
+            *vt,
             false);
 
-    faiss::search_neighbors_to_add(
+    faiss::hnsw_detail::search_neighbors_to_add(
             index->hnsw,
             *dis,
             reference_link_targets,
             index->hnsw.entry_point,
             (*dis)(index->hnsw.entry_point),
             index->hnsw.max_level,
-            reference_vt,
+            *reference_vt,
             true);
 
     EXPECT_EQ(link_targets.size(), reference_link_targets.size());
@@ -714,8 +720,10 @@ TEST_F(HNSWTest, TEST_search_level_0) {
             bres2);
 
     faiss::HNSWStats stats1, stats2;
-    faiss::VisitedTable vt1(index->ntotal);
-    faiss::VisitedTable vt2(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> vt1 =
+            faiss::VisitedTable::create(index->ntotal);
+    std::unique_ptr<faiss::VisitedTable> vt2 =
+            faiss::VisitedTable::create(index->ntotal);
     auto nprobe = 5;
     const faiss::HNSW::storage_idx_t values[] = {1, 2, 3, 4, 5};
     const faiss::HNSW::storage_idx_t* nearest_i = values;
@@ -725,13 +733,13 @@ TEST_F(HNSWTest, TEST_search_level_0) {
     // search_type == 1
     res1.begin(0);
     index->hnsw.search_level_0(
-            *dis, res1, nprobe, nearest_i, nearest_d, 1, stats1, vt1, nullptr);
+            *dis, res1, nprobe, nearest_i, nearest_d, 1, stats1, *vt1, nullptr);
     res1.end();
 
     // search_type == 2
     res2.begin(0);
     index->hnsw.search_level_0(
-            *dis, res2, nprobe, nearest_i, nearest_d, 2, stats2, vt2, nullptr);
+            *dis, res2, nprobe, nearest_i, nearest_d, 2, stats2, *vt2, nullptr);
     res2.end();
 
     // search_type 1 calls search_from_candidates in a loop nprobe times.
@@ -741,4 +749,74 @@ TEST_F(HNSWTest, TEST_search_level_0) {
     EXPECT_GT(stats1.nhops, stats2.nhops);
     EXPECT_GT(stats1.n1, stats2.n1);
     EXPECT_GT(stats1.n2, stats2.n2);
+}
+
+TEST(VisitedTableReuse, ReusesGrowsAndResets) {
+    // get_reusable() hands back the same thread-local object across calls
+    // (no per-call allocation) ...
+    faiss::VisitedTable& t1 = faiss::VisitedTable::get_reusable(100);
+    faiss::VisitedTable& t2 = faiss::VisitedTable::get_reusable(100);
+    EXPECT_EQ(&t1, &t2);
+
+    // ... and hands it back clean: a mark set before re-acquiring must not
+    // survive, since a reused table may carry stamps from a prior search.
+    t2.set(42);
+    EXPECT_TRUE(t2.get(42));
+    faiss::VisitedTable& t3 = faiss::VisitedTable::get_reusable(100);
+    EXPECT_EQ(&t2, &t3);
+    EXPECT_FALSE(t3.get(42));
+
+    // Growing to a larger size keeps the same object and exposes the new range.
+    faiss::VisitedTable& t4 = faiss::VisitedTable::get_reusable(1000);
+    EXPECT_EQ(&t3, &t4);
+    EXPECT_FALSE(t4.get(900));
+    EXPECT_TRUE(t4.set(900));
+    EXPECT_TRUE(t4.get(900));
+}
+
+// Restores the process-global OpenMP thread count on scope exit, so a test that
+// changes it via omp_set_num_threads does not leak the setting into later
+// tests.
+struct ScopedOmpThreads {
+    int saved = omp_get_max_threads();
+    ~ScopedOmpThreads() {
+        omp_set_num_threads(saved);
+    }
+};
+
+TEST_F(HNSWTest, TEST_search_reuse_correctness) {
+    ScopedOmpThreads omp_guard;
+
+    std::vector<faiss::idx_t> I1(k * nq), I2(k * nq);
+    std::vector<float> D1(k * nq), D2(k * nq);
+
+    // Two back-to-back searches must be identical: the reused visited table
+    // must not carry state across search() calls.
+    omp_set_num_threads(1);
+    index->search(nq, xq->data(), k, D1.data(), I1.data());
+    index->search(nq, xq->data(), k, D2.data(), I2.data());
+    EXPECT_EQ(I1, I2);
+    EXPECT_EQ(D1, D2);
+
+    // The reused versioned-array path must match a hash-set reference.
+    std::vector<faiss::idx_t> Iref(k * nq);
+    std::vector<float> Dref(k * nq);
+    index->hnsw.use_visited_hashset = true;
+    index->search(nq, xq->data(), k, Dref.data(), Iref.data());
+    index->hnsw.use_visited_hashset = false;
+    std::vector<faiss::idx_t> Iarr(k * nq);
+    std::vector<float> Darr(k * nq);
+    index->search(nq, xq->data(), k, Darr.data(), Iarr.data());
+    EXPECT_EQ(Iref, Iarr);
+    EXPECT_EQ(Dref, Darr);
+
+    // Multi-threaded search must match single-threaded: each thread reuses its
+    // own thread-local table.
+    index->hnsw.use_visited_hashset = std::nullopt;
+    omp_set_num_threads(4);
+    std::vector<faiss::idx_t> Imt(k * nq);
+    std::vector<float> Dmt(k * nq);
+    index->search(nq, xq->data(), k, Dmt.data(), Imt.data());
+    EXPECT_EQ(I1, Imt);
+    EXPECT_EQ(D1, Dmt);
 }

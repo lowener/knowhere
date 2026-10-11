@@ -68,6 +68,11 @@ class SvsFlatIndexNode : public IndexNode {
         return Status::success;
     }
 
+    bool
+    NeedBitsetExactCount() const override {
+        return true;
+    }
+
     expected<DataSetPtr>
     Search(const DataSetPtr dataset, std::unique_ptr<Config> cfg, const BitsetView& bitset,
            milvus::OpContext* op_context) const override {
@@ -76,7 +81,7 @@ class SvsFlatIndexNode : public IndexNode {
             return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
         }
 
-        if (!bitset.empty() && bitset.count() > 0) {
+        if (!bitset.empty()) {
             return expected<DataSetPtr>::Err(Status::not_implemented, "SVS Flat does not support bitset filtering");
         }
 
@@ -111,12 +116,17 @@ class SvsFlatIndexNode : public IndexNode {
                 }));
             }
             WaitAllSuccess(futs);
+        } catch (const folly::FutureCancellation& e) {
+            LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+            return expected<DataSetPtr>::Err(Status::cancelled, e.what());
         } catch (const std::exception& e) {
             LOG_KNOWHERE_WARNING_ << "error inner faiss: " << e.what();
             return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
         }
 
-        return GenResultDataSet(nq, k, std::move(ids), std::move(distances));
+        auto res = GenResultDataSet(nq, k, std::move(ids), std::move(distances));
+        MapSearchResultIdsToOutIds(res);
+        return res;
     }
 
     expected<DataSetPtr>

@@ -20,6 +20,7 @@
 #include "knowhere/config.h"
 #include "knowhere/index/index_factory.h"
 #include "knowhere/version.h"
+#include "simd/hook.h"
 #ifdef KNOWHERE_WITH_DISKANN
 #include "index/diskann/diskann_config.h"
 #endif
@@ -148,6 +149,33 @@ TEST_CASE("Test config json parse", "[config]") {
         CHECK(s == knowhere::Status::out_of_range_in_json);
     }
 
+    SECTION("check sparse inverted index invalid build params") {
+        auto invalid_sparse_param = GENERATE(table<knowhere::Json, knowhere::Status, std::string>({
+            {knowhere::Json({{knowhere::meta::DIM, 16},
+                             {knowhere::meta::METRIC_TYPE, knowhere::metric::IP},
+                             {knowhere::indexparam::INVERTED_INDEX_ALGO, "DAAT_MAXSCORE"},
+                             {"inverted_index_codec", "invalid_codec"}}),
+             knowhere::Status::invalid_args, "inverted_index_codec"},
+            {knowhere::Json({{knowhere::meta::DIM, 16},
+                             {knowhere::meta::METRIC_TYPE, knowhere::metric::IP},
+                             {knowhere::indexparam::INVERTED_INDEX_ALGO, "BLOCK_MAX_WAND"},
+                             {"block_max_block_size", 0}}),
+             knowhere::Status::out_of_range_in_json, "block_max_block_size"},
+            {knowhere::Json({{knowhere::meta::DIM, 16},
+                             {knowhere::meta::METRIC_TYPE, knowhere::metric::IP},
+                             {knowhere::indexparam::INVERTED_INDEX_ALGO, "NOT_A_REAL_ALGO"}}),
+             knowhere::Status::invalid_args, knowhere::indexparam::INVERTED_INDEX_ALGO},
+        }));
+        const auto& [params, expected_status, expected_msg] = invalid_sparse_param;
+
+        std::string msg;
+        s = knowhere::IndexStaticFaced<knowhere::sparse_u32_f32>::ConfigCheck(
+            knowhere::IndexEnum::INDEX_SPARSE_INVERTED_INDEX, knowhere::Version::GetCurrentVersion().VersionNumber(),
+            params, msg);
+        CHECK(s == expected_status);
+        CHECK(msg.find(expected_msg) != std::string::npos);
+    }
+
     SECTION("check invalid json values") {
         auto invalid_json_str = GENERATE(as<std::string>{},
                                          R"({
@@ -195,7 +223,15 @@ TEST_CASE("Test config json parse", "[config]") {
         CHECK(s == knowhere::Status::invalid_value_in_json);
 
         s = knowhere::Config::FormatAndCheck(scann_dvr_config, build_json2);
-        checkBuildConfig(knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR, build_json2);
+        if (faiss::cppcontrib::knowhere::support_pq_fast_scan) {
+            checkBuildConfig(knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR, build_json2);
+        } else {
+            std::string msg;
+            CHECK(knowhere::IndexStaticFaced<float>::ConfigCheck(knowhere::IndexEnum::INDEX_FAISS_SCANN_DVR,
+                                                                 knowhere::Version::GetCurrentVersion().VersionNumber(),
+                                                                 build_json2,
+                                                                 msg) == knowhere::Status::invalid_instruction_set);
+        }
         CHECK(s == knowhere::Status::success);
     }
 
@@ -723,6 +759,24 @@ TEST_CASE("Test config json parse", "[config]") {
             tmp_json["search_width"] = 4;
             s = knowhere::Config::Load(cagra_config, tmp_json, knowhere::SEARCH);
             CHECK(s == knowhere::Status::success);
+        }
+
+        {
+            // search with legal num_random_samplings
+            knowhere::GpuCuvsCagraConfig cagra_config;
+            auto tmp_json = json;
+            tmp_json["num_random_samplings"] = 32;
+            s = knowhere::Config::Load(cagra_config, tmp_json, knowhere::SEARCH);
+            CHECK(s == knowhere::Status::success);
+        }
+
+        {
+            // search with illegal num_random_samplings
+            knowhere::GpuCuvsCagraConfig cagra_config;
+            auto tmp_json = json;
+            tmp_json["num_random_samplings"] = 0;
+            s = knowhere::Config::Load(cagra_config, tmp_json, knowhere::SEARCH);
+            CHECK(s == knowhere::Status::out_of_range_in_json);
         }
     }
 

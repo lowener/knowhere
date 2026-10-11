@@ -419,16 +419,12 @@ GenerateRandomDistanceIdPair(size_t n) {
 
 inline auto
 GenTestVersionList() {
-    return GENERATE(as<int32_t>{}, knowhere::Version::GetCurrentVersion().VersionNumber());
+    return GENERATE(as<int32_t>{}, knowhere::Version::GetMaximumVersion().VersionNumber());
 }
 
 inline auto
 GenTestEmbListVersionList() {
-#ifdef KNOWHERE_WITH_CARDINAL
-    return GENERATE(as<int32_t>{}, std::max(knowhere::Version::GetCurrentVersion().VersionNumber(), 9));
-#else
-    return GENERATE(as<int32_t>{}, knowhere::Version::GetCurrentVersion().VersionNumber());
-#endif
+    return GENERATE(as<int32_t>{}, knowhere::Version::GetMaximumVersion().VersionNumber());
 }
 
 inline knowhere::DataSetPtr
@@ -549,6 +545,8 @@ GenEmbListDataSet(int rows, int dim, const uint64_t seed = 42, int each_el_len =
     ptr[i] = (size_t)rows;
     const size_t* ptr_const = ptr.release();
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
     ds->SetIsOwner(true);
     return ds;
 }
@@ -574,6 +572,8 @@ GenChunkDataSet(int rows, int dim, const uint64_t seed = 42, int each_el_len = 1
     auto ds = knowhere::GenDataSet(rows, dim, chunk_ts);
     ds->SetNumChunk(num_chunk);
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, (const size_t*)lims);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(num_chunk));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(num_chunk));
     ds->SetIsChunk(true);
     ds->SetIsOwner(true);
     return ds;
@@ -601,6 +601,8 @@ GenChunkBinDataSet(int rows, int dim, const uint64_t seed = 42, int each_el_len 
     auto ds = knowhere::GenDataSet(rows, dim, chunk_ts);
     ds->SetNumChunk(num_chunk);
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, (const size_t*)lims);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(num_chunk));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(num_chunk));
     ds->SetIsChunk(true);
     ds->SetIsOwner(true);
     return ds;
@@ -629,6 +631,8 @@ GenEmbListDataSetWithSomeEmpty(int rows, int dim, const uint64_t seed = 42, int 
     ptr[i] = (size_t)rows;
     const size_t* ptr_const = ptr.release();
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
     ds->SetIsOwner(true);
     return ds;
 }
@@ -654,6 +658,8 @@ SplitEmbListDataSet(const knowhere::DataSetPtr ds, size_t partition_num, int eac
         auto ds = knowhere::GenDataSet(cur_rows, dim, (const DataType*)data + start_el * each_el_len * dim);
         const size_t* ptr_const = ptr + start_el;
         ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+        ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(end_el - start_el));
+        ds->Set(knowhere::meta::NQ, static_cast<int64_t>(end_el - start_el));
         ds->SetIsOwner(false);
         res[i] = std::move(ds);
     }
@@ -677,6 +683,8 @@ GenEmbListBinDataSet(int rows, int dim, int seed = 42, int each_el_len = 10) {
     ptr[i] = (size_t)rows;
     const size_t* ptr_const = ptr.release();
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
     ds->SetIsOwner(true);
     return ds;
 }
@@ -703,6 +711,8 @@ GenQueryEmbListDataSet(int rows, int dim, const uint64_t seed = 42) {
     ptr[i] = (size_t)rows;
     const size_t* ptr_const = ptr.release();
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
     ds->SetIsOwner(true);
     return ds;
 }
@@ -731,6 +741,8 @@ GenQueryEmbListBinDataSet(int rows, int dim, const uint64_t seed = 42) {
     ptr[i] = (size_t)rows;
     const size_t* ptr_const = ptr.release();
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, ptr_const);
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(i));
+    ds->Set(knowhere::meta::NQ, static_cast<int64_t>(i));
     ds->SetIsOwner(true);
     return ds;
 }

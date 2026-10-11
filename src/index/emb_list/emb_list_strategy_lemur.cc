@@ -363,10 +363,28 @@ class LemurEmbListStrategy : public EmbListStrategy {
         config.metric_type = mi.sub_metric_type;
         auto ann_result = index->Search(query_feat_dataset, std::move(cfg), bitset, op_context);
         if (!ann_result.has_value()) {
+            // A cancellation is the caller's request, not a failure of this
+            // index: pass it through unchanged and do not report it as an error.
+            if (ann_result.error() == Status::cancelled) {
+                return expected<DataSetPtr>::Err(Status::cancelled, ann_result.what());
+            }
             LOG_KNOWHERE_ERROR_ << "LEMUR ANN search failed: " << ann_result.what();
             return expected<DataSetPtr>::Err(Status::emb_list_inner_error, "ANN search failed");
         }
         const auto* ann_ids = ann_result.value()->GetIds();
+        // Encoded-list ANN search crosses the normal IndexNode boundary and returns
+        // public list out ids. Map them back to compact list ids before using
+        // emb_list_offset_ and rerank state.
+        auto to_in_list_id = [&](int64_t out_id) -> expected<int64_t> {
+            if (out_id < 0) {
+                return -1;
+            }
+            const auto in_id = index->MapOutToIn(out_id);
+            if (in_id < 0) {
+                return expected<int64_t>::Err(Status::invalid_args, "list id maps outside compact storage");
+            }
+            return in_id;
+        };
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
         auto time = rc.ElapseFromBegin("done");
@@ -385,7 +403,11 @@ class LemurEmbListStrategy : public EmbListStrategy {
             for (size_t q = 0; q < num_query_docs; ++q) {
                 for (int32_t i = 0; i < k; ++i) {
                     if (i < ann_k) {
-                        ids[q * k + i] = ann_ids[q * ann_k + i];
+                        auto list_id = to_in_list_id(ann_ids[q * ann_k + i]);
+                        if (!list_id.has_value()) {
+                            return expected<DataSetPtr>::Err(list_id.error(), list_id.what());
+                        }
+                        ids[q * k + i] = list_id.value();
                         dists[q * k + i] = ann_dists[q * ann_k + i];
                     } else {
                         ids[q * k + i] = -1;
@@ -420,10 +442,14 @@ class LemurEmbListStrategy : public EmbListStrategy {
             size_t nq = q_vec_end - q_vec_start;
             total_query_vecs += nq;
 
-            // Collect candidate doc IDs (no dedup needed — ANN returns doc-level IDs)
+            // Convert stage1 list/doc out ids to list/doc in ids for rerank.
             candidate_docs.clear();
             for (int32_t i = 0; i < ann_k; ++i) {
-                int64_t doc_id = ann_ids[q * ann_k + i];
+                auto doc_id_or = to_in_list_id(ann_ids[q * ann_k + i]);
+                if (!doc_id_or.has_value()) {
+                    return expected<DataSetPtr>::Err(doc_id_or.error(), doc_id_or.what());
+                }
+                int64_t doc_id = doc_id_or.value();
                 if (doc_id >= 0 && doc_id < num_docs_) {
                     candidate_docs.push_back(doc_id);
                 }
@@ -433,10 +459,13 @@ class LemurEmbListStrategy : public EmbListStrategy {
             // Build query dataset for this query document
             auto bf_query_dataset = GenDataSet(nq, original_dim_, query_data + q_vec_start * original_dim_);
 
-            auto status =
-                RerankByCalcDistByIDs(candidate_docs, bf_query_dataset, nq, k, mi.larger_is_closer, mi.is_cosine,
-                                      emb_list_offset_, index, bitset, op_context, mi.agg_func, ids.get() + q * k,
-                                      dists.get() + q * k, total_doc_vecs, total_distance_computations);
+            auto status = RerankByCalcDistByStorageIds(candidate_docs, bf_query_dataset, nq, k, mi.larger_is_closer,
+                                                       mi.is_cosine, emb_list_offset_, index, bitset, op_context,
+                                                       mi.agg_func, ids.get() + q * k, dists.get() + q * k,
+                                                       total_doc_vecs, total_distance_computations);
+            if (status == Status::cancelled) {
+                return expected<DataSetPtr>::Err(Status::cancelled, "rerank cancelled by the caller");
+            }
             if (status != Status::success) {
                 return expected<DataSetPtr>::Err(Status::emb_list_inner_error, "rerank distance computation error");
             }

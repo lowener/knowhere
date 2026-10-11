@@ -14,10 +14,12 @@
 #include <algorithm>
 #include <boost/intrusive/pack_options.hpp>
 #include <cctype>
+#include <cmath>
 #include <exception>
 #include <optional>
 
 #include "index/sparse/block_inverted_index.h"
+#include "index/sparse/codec/adaptive.h"
 #include "index/sparse/codec/maskedvbyte.h"
 #include "index/sparse/codec/streamvbyte.h"
 #include "index/sparse/flatten_inverted_index.h"
@@ -45,39 +47,40 @@ namespace knowhere {
 // Returns nullopt if the data is too small or the first section is not POSTING_LISTS.
 //
 // Binary layout:
-//   [0..32)  File header: version(4), nr_rows(4), max_dim(4), nr_inner_dims(4), reserved(16)
-//   [32..36) nr_sections (uint32_t)
-//   [36..)   Section headers: each is InvertedIndexSectionType(4) + padding(4) + offset(8) + size(8) = 24 bytes
+//   [0..kInvertedIndexFileHeaderSize) File header
+//   [kInvertedIndexFileHeaderSize..)  nr_sections (uint32_t)
+//   Then section headers.
 //   At section[0].offset: encoding_type (uint32_t)
 static std::optional<sparse::inverted::InvertedIndexEncoding>
 peek_encoding_type_from_index_data(const uint8_t* data, size_t size) {
     using sparse::inverted::InvertedIndexEncoding;
     using sparse::inverted::InvertedIndexSectionHeader;
     using sparse::inverted::InvertedIndexSectionType;
+    using sparse::inverted::kInvertedIndexFileHeaderSize;
+    using sparse::inverted::kInvertedIndexSectionCountSize;
 
-    // Need at least: 32 (header) + 4 (nr_sections) + 24 (one section header) = 60 bytes
-    constexpr size_t kMinHeaderSize = 32 + 4 + sizeof(InvertedIndexSectionHeader);
+    constexpr size_t kMinHeaderSize =
+        kInvertedIndexFileHeaderSize + kInvertedIndexSectionCountSize + sizeof(InvertedIndexSectionHeader);
     if (size < kMinHeaderSize) {
         return std::nullopt;
     }
 
-    // Read nr_sections at offset 32
     uint32_t nr_sections = 0;
-    memcpy(&nr_sections, data + 32, sizeof(uint32_t));
+    memcpy(&nr_sections, data + kInvertedIndexFileHeaderSize, sizeof(uint32_t));
     if (nr_sections == 0) {
         return std::nullopt;
     }
 
-    // Read first section header at offset 36
     InvertedIndexSectionHeader first_section{};
-    memcpy(&first_section, data + 36, sizeof(InvertedIndexSectionHeader));
+    memcpy(&first_section, data + kInvertedIndexFileHeaderSize + kInvertedIndexSectionCountSize,
+           sizeof(InvertedIndexSectionHeader));
 
     if (first_section.type != InvertedIndexSectionType::POSTING_LISTS) {
         return std::nullopt;
     }
 
     // encoding_type is the first uint32_t at the section's data offset
-    if (first_section.offset + sizeof(uint32_t) > size) {
+    if (first_section.offset > size || sizeof(uint32_t) > size - first_section.offset) {
         return std::nullopt;
     }
 
@@ -122,6 +125,8 @@ class SparseInvertedIndexNode : public IndexNode {
             }
         }
 
+        RETURN_IF_ERROR(ResolveAutoQuantTypeForTrain(dataset, cfg));
+
         // create index
         auto index_or = CreateIndex(cfg);
         if (!index_or.has_value()) {
@@ -139,26 +144,144 @@ class SparseInvertedIndexNode : public IndexNode {
     }
 
     Status
-    Add(const DataSetPtr dataset, std::shared_ptr<Config> config, bool use_knowhere_build_pool) override {
+    ResolveAutoQuantTypeForTrain(const DataSetPtr& dataset, SparseInvertedIndexConfig& cfg,
+                                 bool is_growable = false) const {
+        if (cfg.quant_type.value_or("") != "auto") {
+            return Status::success;
+        }
+        if (!IsMetricType(cfg.metric_type.value(), metric::BM25)) {
+            LOG_KNOWHERE_ERROR_ << "quant_type=auto is only supported for BM25";
+            return Status::invalid_args;
+        }
+        if (index_version_ < kBm25AutoU8MinVersion) {
+            LOG_KNOWHERE_ERROR_ << "BM25 quant_type=auto requires index version >= " << kBm25AutoU8MinVersion;
+            return Status::invalid_args;
+        }
+
+        const auto algo = NormalizeInvertedIndexAlgo(cfg.inverted_index_algo.value_or(""));
+        if (algo != "SINDI" || is_growable) {
+            cfg.quant_type = "u16";
+            LOG_KNOWHERE_INFO_ << "BM25 quant_type=auto selected u16 for " << (is_growable ? "growable" : "non-SINDI")
+                               << " index";
+            return Status::success;
+        }
+        if (dataset == nullptr || (dataset->GetRows() > 0 && dataset->GetTensor() == nullptr)) {
+            LOG_KNOWHERE_ERROR_ << "SINDI BM25 quant_type=auto requires a valid training dataset";
+            return Status::invalid_args;
+        }
+
+        uint64_t total_postings = 0;
+        uint64_t overflow_postings = 0;
+        const auto* rows = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());
+        for (int64_t row_id = 0; row_id < dataset->GetRows(); ++row_id) {
+            const auto& row = rows[row_id];
+            total_postings += row.size();
+            for (size_t i = 0; i < row.size(); ++i) {
+                // Match the u16 baseline and restore-u8 sidecar semantics: values
+                // in [255, 256) truncate to 255 and do not need restoration.
+                if (row[i].val >= 256.0f) {
+                    ++overflow_postings;
+                }
+            }
+        }
+
+        const float configured_threshold = cfg.bm25_u8_max_overflow_ratio.value();
+        // The config framework stores ratios as float. Widen the inclusive
+        // boundary by one float ULP so decimal boundaries such as 1/10,000 are
+        // not rejected because 0.0001f is represented slightly below 0.0001.
+        const double inclusive_threshold =
+            static_cast<double>(std::nextafter(configured_threshold, std::numeric_limits<float>::infinity()));
+        const bool use_u8 = total_postings == 0 || static_cast<double>(overflow_postings) <=
+                                                       inclusive_threshold * static_cast<double>(total_postings);
+        cfg.quant_type = use_u8 ? "u8" : "u16";
+        const double overflow_ratio =
+            total_postings == 0 ? 0.0 : static_cast<double>(overflow_postings) / total_postings;
+        LOG_KNOWHERE_INFO_ << "SINDI BM25 quant_type=auto selected " << cfg.quant_type.value()
+                           << ": overflow_postings=" << overflow_postings << ", total_postings=" << total_postings
+                           << ", overflow_ratio=" << overflow_ratio
+                           << ", u8_max_overflow_ratio=" << configured_threshold;
+        return Status::success;
+    }
+
+    Status
+    ResolveQuantTypeForDeserialize(const uint8_t* data, size_t size, SparseInvertedIndexConfig& cfg) const {
+        if (version_use_raw_data()) {
+            // The raw-data format has no posting-type header.
+            return cfg.ValidateQuantType(nullptr);
+        }
+
+        using sparse::inverted::InvertedIndexQuantType;
+        const auto posting_type = sparse::inverted::peek_quant_type_from_index_data(data, size);
+        if (!posting_type.has_value()) {
+            return Status::invalid_serialized_index_type;
+        }
+        if (posting_type.value() == InvertedIndexQuantType::UNSPECIFIED) {
+            // Legacy indexes require the original build parameters or version defaults.
+            return cfg.ValidateQuantType(nullptr);
+        }
+        std::string resolved_quant_type;
+        bool is_ip = false;
+        switch (posting_type.value()) {
+            case InvertedIndexQuantType::IP_FP16:
+                resolved_quant_type = "fp16";
+                is_ip = true;
+                break;
+            case InvertedIndexQuantType::IP_FP32:
+                resolved_quant_type = "fp32";
+                is_ip = true;
+                break;
+            case InvertedIndexQuantType::BM25_U8:
+                resolved_quant_type = "u8";
+                break;
+            case InvertedIndexQuantType::BM25_U16:
+                resolved_quant_type = "u16";
+                break;
+            case InvertedIndexQuantType::BM25_U32:
+                resolved_quant_type = "u32";
+                break;
+            default:
+                LOG_KNOWHERE_ERROR_ << "Unknown posting quantization type in serialized index: "
+                                    << static_cast<uint32_t>(posting_type.value());
+                return Status::invalid_serialized_index_type;
+        }
+        if (!IsMetricType(cfg.metric_type.value(), is_ip ? metric::IP : metric::BM25)) {
+            return Status::invalid_serialized_index_type;
+        }
+        cfg.quant_type = resolved_quant_type;
+        return Status::success;
+    }
+
+    Status
+    Add(const DataSetPtr dataset, std::shared_ptr<Config> /*config*/, bool use_knowhere_build_pool) override {
         if (!index_) {
             LOG_KNOWHERE_ERROR_ << "Could not add data to uninitialized " << Type() << " index";
             return Status::empty_index;
         }
 
-        auto build_pool_wrapper = std::make_shared<ThreadPoolWrapper>(build_pool_, use_knowhere_build_pool);
-        auto tryObj =
-            build_pool_wrapper
-                ->push([&] {
-                    return index_->add(static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor()),
-                                       dataset->GetRows(), dataset->GetDim());
-                })
-                .getTry();
-        if (!tryObj.hasValue()) {
-            LOG_KNOWHERE_WARNING_ << "Failed to add data to index " << Type() << ": " << tryObj.exception().what();
-            return Status::sparse_inner_error;
+        auto add = [&] {
+            return index_->add(static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor()),
+                               dataset->GetRows(), dataset->GetDim());
+        };
+        if (!use_knowhere_build_pool) {
+            auto build_pool_wrapper = std::make_shared<ThreadPoolWrapper>(build_pool_, use_knowhere_build_pool);
+            auto try_obj = build_pool_wrapper->push(add).getTry();
+            if (!try_obj.hasValue()) {
+                LOG_KNOWHERE_WARNING_ << "Failed to add data to index " << Type() << ": " << try_obj.exception().what();
+                return Status::sparse_inner_error;
+            }
+            return try_obj.value();
         }
 
-        return tryObj.value();
+        // Sealed index implementations submit their parallel build tasks to the build pool inside add().
+        try {
+            return add();
+        } catch (const std::exception& e) {
+            LOG_KNOWHERE_WARNING_ << "Failed to add data to index " << Type() << ": " << e.what();
+            return Status::sparse_inner_error;
+        } catch (...) {
+            LOG_KNOWHERE_WARNING_ << "Failed to add data to index " << Type() << ": unknown exception";
+            return Status::sparse_inner_error;
+        }
     }
 
     [[nodiscard]] expected<DataSetPtr>
@@ -178,8 +301,28 @@ class SparseInvertedIndexNode : public IndexNode {
         }
         auto search_params = search_params_or.value();
 
+        const bool refine = index_->refinement_enabled();
+        if ((!refine && (cfg.refine_query_mass_percentage.value_or(1) != 1 || cfg.refine_k.value_or(1) != 1)) ||
+            (refine && (cfg.drop_ratio_search.value_or(0) != 0 || cfg.refine_factor.value_or(1) != 1))) {
+            return expected<DataSetPtr>::Err(
+                Status::invalid_args,
+                "SINDI refinement requires a refined index, drop_ratio_search=0 and refine_factor=1; use refine_k");
+        }
+
+        search_params.refine_query_mass_percentage = cfg.refine_query_mass_percentage.value_or(1);
+        search_params.refine_k = cfg.refine_k.value_or(1);
+
         auto queries = static_cast<const sparse::SparseRow<value_type>*>(dataset->GetTensor());
         auto nq = dataset->GetRows();
+
+        if (refine) {
+            for (int64_t i = 0; i < nq; ++i) {
+                if (!sparse::inverted::sindi::valid_refinement_row(queries[i])) {
+                    return expected<DataSetPtr>::Err(Status::invalid_args, "Invalid SINDI refinement query");
+                }
+            }
+        }
+
         auto k = cfg.k.value();
         auto p_id = std::make_unique<sparse::label_t[]>(nq * k);
         auto p_dist = std::make_unique<float[]>(nq * k);
@@ -193,7 +336,9 @@ class SparseInvertedIndexNode : public IndexNode {
         }
         WaitAllSuccess(futs);
 
-        return GenResultDataSet(nq, k, p_id.release(), p_dist.release());
+        auto res = GenResultDataSet(nq, k, p_id.release(), p_dist.release());
+        this->MapSearchResultIdsToOutIds(res);
+        return res;
     }
 
     // TODO: for now inverted index and wand use the same impl for AnnIterator.
@@ -218,6 +363,8 @@ class SparseInvertedIndexNode : public IndexNode {
         auto search_params = search_params_or.value();
 
         auto vec = std::vector<std::shared_ptr<IndexNode::iterator>>(nq, nullptr);
+        const auto& id_map = this->GetIdMap();
+        const auto* result_id_map = this->SearchResultIdMap(id_map);
         try {
             for (int i = 0; i < nq; ++i) {
                 // Heavy computations with `compute_dist_func` will be deferred until the first call to
@@ -240,6 +387,7 @@ class SparseInvertedIndexNode : public IndexNode {
 
                 auto it =
                     std::make_shared<PrecomputedDistanceIterator>(compute_dist_func, true, use_knowhere_search_pool);
+                it->SetResultIdMap(result_id_map);
                 vec[i] = it;
             }
         } catch (const std::exception& e) {
@@ -280,6 +428,7 @@ class SparseInvertedIndexNode : public IndexNode {
         if (this->version_use_raw_data()) {
             RETURN_IF_ERROR(index_->convert_to_raw_data(writer));
         } else {
+            ConfigureSindiSerialization(index_.get());
             RETURN_IF_ERROR(index_->serialize(writer));
         }
         std::shared_ptr<uint8_t[]> data(writer.data());
@@ -308,6 +457,7 @@ class SparseInvertedIndexNode : public IndexNode {
                                    << " from serialized index data";
             }
         }
+        RETURN_IF_ERROR(ResolveQuantTypeForDeserialize(binary->data.get(), binary->size, cfg));
 
         // create or recreate index
         if (index_ != nullptr) {
@@ -363,6 +513,7 @@ class SparseInvertedIndexNode : public IndexNode {
                                    << " from index file " << filename;
             }
         }
+        RETURN_IF_ERROR(ResolveQuantTypeForDeserialize(reinterpret_cast<const uint8_t*>(mapped_memory), map_size, cfg));
 
         // create or recreate index
         if (index_ != nullptr) {
@@ -439,6 +590,15 @@ class SparseInvertedIndexNode : public IndexNode {
         return Status::success;
     }
 
+    Status
+    ValidateInvertedIndexCodec(const std::string& codec) const {
+        if (IsSupportedSparseInvertedIndexCodec(codec)) {
+            return Status::success;
+        }
+        LOG_KNOWHERE_ERROR_ << "Unsupported sparse inverted index codec " << codec;
+        return Status::invalid_args;
+    }
+
     template <typename DType, typename QType, sparse::inverted::IndexScorerType MetricType>
     expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>
     CreateIndexImpl(const SparseInvertedIndexConfig& cfg, bool is_growable = false,
@@ -479,6 +639,12 @@ class SparseInvertedIndexNode : public IndexNode {
                         index = std::make_unique<sparse::inverted::BlockInvertedIndex<DType, QType, MetricType>>(codec);
                         break;
                     }
+                    case InvertedIndexEncoding::BLOCK_ADAPTIVE: {
+                        LOG_KNOWHERE_INFO_ << "Detected BLOCK_ADAPTIVE encoding in index file";
+                        auto codec = std::make_shared<sparse::inverted::AdaptiveBlockCodec>();
+                        index = std::make_unique<sparse::inverted::BlockInvertedIndex<DType, QType, MetricType>>(codec);
+                        break;
+                    }
                     case InvertedIndexEncoding::FIXED_DOCID_WINDOWS:
                         // SINDI encoding should not reach create_index_before_v10; fall through to default codec
                         LOG_KNOWHERE_WARNING_ << "Unexpected FIXED_DOCID_WINDOWS encoding in create_index_before_v10";
@@ -496,14 +662,19 @@ class SparseInvertedIndexNode : public IndexNode {
                     index = std::make_unique<sparse::inverted::FlattenInvertedIndex<DType, QType>>();
                 } else {
                     // use different index type based on codec
-                    if (inverted_index_codec == "block_streamvbyte" || inverted_index_codec == "block_maskedvbyte") {
+                    if (inverted_index_codec == "block_streamvbyte" || inverted_index_codec == "block_maskedvbyte" ||
+                        inverted_index_codec == "block_adaptive") {
                         sparse::inverted::BlockCodecPtr codec;
                         if (inverted_index_codec == "block_streamvbyte") {
                             codec = std::make_shared<sparse::inverted::StreamVByteBlockCodec>();
-                        } else {
+                        } else if (inverted_index_codec == "block_maskedvbyte") {
                             codec = std::make_shared<sparse::inverted::MaskedVByteBlockCodec>();
+                        } else {
+                            codec = std::make_shared<sparse::inverted::AdaptiveBlockCodec>();
                         }
                         index = std::make_unique<sparse::inverted::BlockInvertedIndex<DType, QType, MetricType>>(codec);
+                    } else if (!inverted_index_codec.empty()) {
+                        return expected<IndexPtr>::Err(Status::invalid_args, "unsupported sparse inverted index codec");
                     } else {
                         index = std::make_unique<sparse::inverted::FlattenInvertedIndex<DType, QType>>();
                     }
@@ -534,19 +705,28 @@ class SparseInvertedIndexNode : public IndexNode {
 
         if (version_default_to_daat_maxscore()) {
             const std::string algo = get_inverted_index_algo("DAAT_MAXSCORE");
-            const std::string codec = cfg.inverted_index_codec.value_or("block_streamvbyte");
+            const std::string codec = cfg.inverted_index_codec.value_or(default_inverted_index_codec());
             return create_index_before_v10(algo, codec);
         } else if (is_ip) {
             const std::string algo = get_inverted_index_algo("SINDI");
-            const std::string codec = cfg.inverted_index_codec.value_or("block_streamvbyte");
+            const std::string codec = cfg.inverted_index_codec.value_or(default_inverted_index_codec());
             // When encoding is available and not FIXED_DOCID_WINDOWS, the file was not
             // built with SINDI, so use create_index_before_v10 to match the actual file encoding.
             bool use_sindi =
                 algo == "SINDI" && (!encoding.has_value() ||
                                     encoding.value() == sparse::inverted::InvertedIndexEncoding::FIXED_DOCID_WINDOWS);
             if (use_sindi) {
-                auto index = std::make_unique<sparse::inverted::SindiInvertedIndexIP>(
-                    cfg.sindi_window_size.value_or(sparse::inverted::SindiInvertedIndexIP::max_window_size));
+                auto window_size =
+                    cfg.sindi_window_size.value_or(sparse::inverted::SindiInvertedIndexIP::max_window_size);
+                IndexPtr index;
+                if (is_growable) {
+                    index = std::make_unique<sparse::inverted::GrowableSindiInvertedIndexIP>(
+                        window_size, cfg.refine.value_or(false));
+                } else {
+                    index = std::make_unique<sparse::inverted::SindiInvertedIndexIP>(window_size,
+                                                                                     cfg.refine.value_or(false));
+                }
+                ConfigureSindiSerialization(index.get());
                 index->set_build_algo(algo);
                 index->set_build_scorer(sparse::inverted::IndexScorerConfig{
                     .scorer_type = sparse::inverted::IndexScorerType::IP,
@@ -557,13 +737,24 @@ class SparseInvertedIndexNode : public IndexNode {
             }
         } else if (is_bm25) {
             const std::string algo = get_inverted_index_algo("DAAT_MAXSCORE");
-            const std::string codec = cfg.inverted_index_codec.value_or("block_streamvbyte");
+            const std::string codec = cfg.inverted_index_codec.value_or(default_inverted_index_codec());
             bool use_sindi =
                 algo == "SINDI" && (!encoding.has_value() ||
                                     encoding.value() == sparse::inverted::InvertedIndexEncoding::FIXED_DOCID_WINDOWS);
             if (use_sindi) {
-                auto index = std::make_unique<sparse::inverted::SindiInvertedIndexBM25>(
-                    cfg.sindi_window_size.value_or(sparse::inverted::SindiInvertedIndexBM25::max_window_size));
+                auto window_size =
+                    cfg.sindi_window_size.value_or(sparse::inverted::SindiInvertedIndexBM25::max_window_size);
+                IndexPtr index;
+                if constexpr (std::is_same_v<QType, uint8_t>) {
+                    index = std::make_unique<sparse::inverted::SindiInvertedIndexBM25U8>(window_size);
+                } else {
+                    if (is_growable) {
+                        index = std::make_unique<sparse::inverted::GrowableSindiInvertedIndexBM25>(window_size);
+                    } else {
+                        index = std::make_unique<sparse::inverted::SindiInvertedIndexBM25>(window_size);
+                    }
+                }
+                ConfigureSindiSerialization(index.get());
                 index->set_build_algo(algo);
                 index->set_build_scorer(sparse::inverted::IndexScorerConfig{
                     .scorer_type = sparse::inverted::IndexScorerType::BM25,
@@ -583,14 +774,34 @@ class SparseInvertedIndexNode : public IndexNode {
     expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>
     CreateIndex(const SparseInvertedIndexConfig& cfg, bool is_growable = false,
                 std::optional<sparse::inverted::InvertedIndexEncoding> encoding = std::nullopt) const {
+        if (cfg.refine.value_or(false)) {
+            const auto algo = NormalizeInvertedIndexAlgo(cfg.inverted_index_algo.value_or(""));
+            if (index_version_ < 11 || !IsMetricType(cfg.metric_type.value(), metric::IP) ||
+                (!algo.empty() && algo != "SINDI") ||
+                (!cfg.quant_type.value_or("").empty() && cfg.quant_type.value() != "fp16")) {
+                return expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>::Err(
+                    Status::invalid_args, "refine requires SINDI FP16 IP version >= 11");
+            }
+        }
+
         const auto explicit_algo = NormalizeInvertedIndexAlgo(cfg.inverted_index_algo.value_or(""));
         const auto status = ValidateInvertedIndexAlgo(explicit_algo);
         if (status != Status::success) {
             return expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>::Err(
                 status, "unsupported sparse inverted index algorithm");
         }
+        const auto codec_status = ValidateInvertedIndexCodec(cfg.inverted_index_codec.value_or(""));
+        if (codec_status != Status::success) {
+            return expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>::Err(
+                codec_status, "unsupported sparse inverted index codec");
+        }
 
         auto qt = cfg.quant_type.value_or("");
+        if (qt == "auto") {
+            return expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>::Err(
+                Status::invalid_args, "quant_type=auto was not resolved before index creation");
+        }
+        const auto requested_algo = NormalizeInvertedIndexAlgo(cfg.inverted_index_algo.value_or(""));
         using sparse::inverted::IndexScorerType;
         if (IsMetricType(cfg.metric_type.value(), metric::IP)) {
             // version < threshold forces fp32; version >= threshold defaults to fp16, user can override to fp32
@@ -601,6 +812,13 @@ class SparseInvertedIndexNode : public IndexNode {
                 return CreateIndexImpl<value_type, float, IndexScorerType::IP>(cfg, is_growable, encoding);
             }
         } else {
+            if (qt == "u8") {
+                if (index_version_ < kBm25AutoU8MinVersion || requested_algo != "SINDI" || is_growable) {
+                    return expected<std::unique_ptr<sparse::inverted::InvertedIndex<value_type>>>::Err(
+                        Status::invalid_args, "u8 quantization requires sealed SINDI with index version >= 11");
+                }
+                return CreateIndexImpl<value_type, uint8_t, IndexScorerType::BM25>(cfg, is_growable, encoding);
+            }
             // BM25 default: u16
             if (qt == "u32") {
                 return CreateIndexImpl<value_type, uint32_t, IndexScorerType::BM25>(cfg, is_growable, encoding);
@@ -610,7 +828,38 @@ class SparseInvertedIndexNode : public IndexNode {
         }
     }
 
+    bool
+    version_sindi_uses_mphf_section() const {
+        return index_version_ >= kSindiMphfSectionMinVersion;
+    }
+
+    void
+    ConfigureSindiSerialization(sparse::inverted::InvertedIndex<value_type>* index) const {
+        if (index == nullptr) {
+            return;
+        }
+
+        const bool use_legacy_trailer = !version_sindi_uses_mphf_section();
+        // Legacy SINDI loaders reject section counts above 4, so v10 keeps
+        // MPHF bytes in DIM_MAP_REVERSE. v11 writes DIM_MAP_MPHF separately.
+        if (auto* sindi_ip = dynamic_cast<sparse::inverted::SindiInvertedIndexIP*>(index)) {
+            sindi_ip->set_legacy_dim_map_mphf_trailer_workaround(use_legacy_trailer);
+        } else if (auto* growable_sindi_ip = dynamic_cast<sparse::inverted::GrowableSindiInvertedIndexIP*>(index)) {
+            growable_sindi_ip->set_legacy_dim_map_mphf_trailer_workaround(use_legacy_trailer);
+        } else if (auto* sindi_bm25 = dynamic_cast<sparse::inverted::SindiInvertedIndexBM25*>(index)) {
+            sindi_bm25->set_legacy_dim_map_mphf_trailer_workaround(use_legacy_trailer);
+        } else if (auto* sindi_bm25_u8 = dynamic_cast<sparse::inverted::SindiInvertedIndexBM25U8*>(index)) {
+            sindi_bm25_u8->set_legacy_dim_map_mphf_trailer_workaround(use_legacy_trailer);
+        } else if (auto* growable_sindi_bm25 = dynamic_cast<sparse::inverted::GrowableSindiInvertedIndexBM25*>(index)) {
+            growable_sindi_bm25->set_legacy_dim_map_mphf_trailer_workaround(use_legacy_trailer);
+        }
+    }
+
  private:
+    static constexpr int32_t kBm25AutoU8MinVersion = 11;
+    static constexpr int32_t kBlockAdaptiveDefaultMinVersion = 11;
+    static constexpr int32_t kSindiMphfSectionMinVersion = 11;
+
     /**
      * @brief Prepare search parameters
      *
@@ -620,6 +869,7 @@ class SparseInvertedIndexNode : public IndexNode {
     expected<sparse::inverted::InvertedIndexSearchParams>
     PrepareSearchParams(const SparseInvertedIndexConfig& config) const {
         sparse::inverted::InvertedIndexSearchParams search_params = {
+            .bulk_query_nnz_threshold = static_cast<size_t>(config.bulk_query_nnz_threshold.value()),
             .approx =
                 {
                     .drop_ratio_search = config.drop_ratio_search.value_or(0.0f),
@@ -694,7 +944,9 @@ class SparseInvertedIndexNode : public IndexNode {
             search_params.scorer_config.scorer_params.bm25.b =
                 config.bm25_b.value_or(index_->get_scorer_config().scorer_params.bm25.b);
             if (search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_WAND ||
-                search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE) {
+                search_params.algo == sparse::inverted::InvertedIndexAlgo::DAAT_MAXSCORE ||
+                search_params.algo == sparse::inverted::InvertedIndexAlgo::BLOCK_MAX_WAND ||
+                search_params.algo == sparse::inverted::InvertedIndexAlgo::BLOCK_MAX_MAXSCORE) {
                 if (search_params.scorer_config.scorer_params.bm25.k1 !=
                         index_->get_scorer_config().scorer_params.bm25.k1 ||
                     search_params.scorer_config.scorer_params.bm25.b !=
@@ -738,6 +990,24 @@ class SparseInvertedIndexNode : public IndexNode {
     bool
     version_default_to_daat_maxscore() const {
         return index_version_ < 10;
+    }
+
+    bool
+    version_default_to_flat_codec() const {
+#ifndef KNOWHERE_WITH_CARDINAL
+        // Knowhere 2.6 writes v8/v9 sparse indexes with the legacy flat codec.
+        return index_version_ >= 8 && index_version_ < 10;
+#else
+        return false;
+#endif
+    }
+
+    std::string
+    default_inverted_index_codec() const {
+        if (version_default_to_flat_codec()) {
+            return "";
+        }
+        return index_version_ >= kBlockAdaptiveDefaultMinVersion ? "block_adaptive" : "block_streamvbyte";
     }
 
     // used to load index
@@ -794,8 +1064,13 @@ class SparseInvertedIndexNodeCC : public SparseInvertedIndexNode<T, use_wand> {
             }
         }
 
+        RETURN_IF_ERROR(this->ResolveAutoQuantTypeForTrain(dataset, cfg, true));
+
         // create index
         auto index_or = this->CreateIndex(cfg, true);
+        if (!index_or.has_value()) {
+            return index_or.error();
+        }
 
         if (this->index_ != nullptr) {
             LOG_KNOWHERE_WARNING_
@@ -887,9 +1162,27 @@ class SparseInvertedIndexNodeCC : public SparseInvertedIndexNode<T, use_wand> {
         if (raw_data_.empty()) {
             return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds failed: raw data is empty");
         }
+        if (dataset == nullptr) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds dataset is null");
+        }
 
         auto rows = dataset->GetRows();
         auto ids = dataset->GetIds();
+        std::vector<int64_t> in_ids;
+        auto status = this->CompactOutToIn(ids, rows, in_ids);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
+        }
+        ids = in_ids.data();
+        rows = static_cast<int64_t>(in_ids.size());
+        if (rows == 0) {
+            // Public-id retrieve may compact missing nullable ids to an empty
+            // storage-id set. Return an empty sparse result without touching
+            // backend storage.
+            auto res = GenResultDataSet(0, 0, static_cast<const sparse::SparseRow<value_type>*>(nullptr));
+            res->SetIsSparse(true);
+            return res;
+        }
         auto data = std::make_unique<sparse::SparseRow<value_type>[]>(rows);
         int64_t dim = 0;
 

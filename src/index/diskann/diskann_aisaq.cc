@@ -34,7 +34,8 @@ class AisaqIndexNode : public IndexNode {
  public:
     using DistType = float;
 
-    AisaqIndexNode(const int32_t& version, const Object& object) : is_prepared_(false), dim_(-1), count_(-1) {
+    AisaqIndexNode(const int32_t& version, const Object& object)
+        : IndexNode(version), is_prepared_(false), dim_(-1), count_(-1) {
         assert(typeid(object) == typeid(Pack<std::shared_ptr<milvus::FileManager>>));
         auto diskann_index_pack = dynamic_cast<const Pack<std::shared_ptr<milvus::FileManager>>*>(&object);
         assert(diskann_index_pack != nullptr);
@@ -52,6 +53,11 @@ class AisaqIndexNode : public IndexNode {
     Status
     Add(const DataSetPtr dataset, std::shared_ptr<Config> cfg, bool use_knowhere_build_pool) override {
         return Status::not_implemented;
+    }
+
+    bool
+    NeedBitsetExactCount() const override {
+        return true;
     }
 
     expected<DataSetPtr>
@@ -192,6 +198,9 @@ TryDiskANNCall(std::function<void()>&& diskann_call) {
     try {
         diskann_call();
         return Status::success;
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "DiskANN call cancelled by the caller: " << e.what();
+        return Status::cancelled;
     } catch (const diskann::FileException& e) {
         LOG_KNOWHERE_ERROR_ << "AiSAQ File Exception: " << e.what();
         return Status::disk_file_error;
@@ -710,11 +719,15 @@ AisaqIndexNode<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Confi
         }));
     }
 
-    if (TryDiskANNCall([&]() { WaitAllSuccess(futures); }) != Status::success) {
+    if (auto stat = TryDiskANNCall([&]() { WaitAllSuccess(futures); }); stat != Status::success) {
+        if (stat == Status::cancelled) {
+            return expected<DataSetPtr>::Err(stat, "search cancelled by the caller");
+        }
         return expected<DataSetPtr>::Err(Status::aisaq_error, "some search failed");
     }
 
     auto res = GenResultDataSet(nq, k, std::move(p_id), std::move(p_dist));
+    MapSearchResultIdsToOutIds(res);
 
     // set visit_info json string into result dataset
     if (feder_result != nullptr) {
@@ -735,13 +748,29 @@ AisaqIndexNode<DataType>::Search(const DataSetPtr dataset, std::unique_ptr<Confi
 template <typename DataType>
 expected<DataSetPtr>
 AisaqIndexNode<DataType>::GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const {
-    if (!is_prepared_.load() || !pq_flash_index_) {
-        LOG_KNOWHERE_ERROR_ << "Failed to load AiSAQ.";
-        return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
+    if (dataset == nullptr) {
+        return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds dataset is null");
     }
     auto dim = Dim();
     auto rows = dataset->GetRows();
     auto ids = dataset->GetIds();
+    std::vector<int64_t> in_ids;
+    auto status = CompactOutToIn(ids, rows, in_ids);
+    if (status != Status::success) {
+        return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
+    }
+    ids = in_ids.data();
+    rows = static_cast<int64_t>(in_ids.size());
+    if (rows == 0) {
+        // Public-id retrieve may compact missing nullable ids to an empty
+        // storage-id set. Return an empty vector result without touching
+        // backend storage.
+        return GenResultDataSet(0, dim, nullptr);
+    }
+    if (!is_prepared_.load() || !pq_flash_index_) {
+        LOG_KNOWHERE_ERROR_ << "Failed to load AiSAQ.";
+        return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
+    }
     auto* data = new DataType[dim * rows];
     if (data == nullptr) {
         LOG_KNOWHERE_ERROR_ << "Failed to allocate memory for data.";

@@ -7,8 +7,10 @@
 
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <queue>
+#include <utility>
 #include <vector>
 
 #include <omp.h>
@@ -25,7 +27,9 @@ namespace faiss {
 // Forward declarations to avoid circular dependency.
 struct IndexHNSW;
 struct IndexHNSWFlatPanorama;
-struct MinimaxHeap;
+template <class HC_>
+struct MinimaxHeapT;
+using MinimaxHeap = MinimaxHeapT<CMax<float, int32_t>>;
 class LockVector;
 
 /** Implementation of the Hierarchical Navigable Small World
@@ -60,29 +64,51 @@ struct HNSW {
     /// internal storage of vectors (32 bits: this is expensive)
     using storage_idx_t = int32_t;
 
-    // for now we do only these distances
-    using C = CMax<float, int64_t>;
+    // The two comparator flavors HNSW supports. CMax (smaller-is-better)
+    // is the default; CMin (larger-is-better) is used when `is_similarity`
+    // is set on the owning index.
+    using C_distance = CMax<float, int64_t>;
+    using C_similarity = CMin<float, int64_t>;
+
+    // Back-compat alias: keeps `HNSW::C` resolving to the distance
+    // (CMax) comparator everywhere the type is referenced directly.
+    using C = C_distance;
 
     typedef std::pair<float, storage_idx_t> Node;
 
     /// to sort pairs of (id, distance) from nearest to farthest or the reverse
-    struct NodeDistCloser {
+    template <class CT>
+    struct NodeDistCloserT {
         float d;
         int id;
-        NodeDistCloser(float d_in, int id_in) : d(d_in), id(id_in) {}
-        bool operator<(const NodeDistCloser& obj1) const {
-            return d < obj1.d;
+        NodeDistCloserT(float d_in, int id_in) : d(d_in), id(id_in) {}
+        bool operator<(const NodeDistCloserT& obj1) const {
+            // priority_queue keeps the "worst" element at the top so that
+            // when the queue is full we can pop it. For CMax (distance) the
+            // worst element is the largest d; for CMin (similarity) it is
+            // the smallest d. Equivalent to: obj1.d "better than" d.
+            return CT::cmp(obj1.d, d);
         }
     };
 
-    struct NodeDistFarther {
+    template <class CT>
+    struct NodeDistFartherT {
         float d;
         int id;
-        NodeDistFarther(float d_in, int id_in) : d(d_in), id(id_in) {}
-        bool operator<(const NodeDistFarther& obj1) const {
-            return d > obj1.d;
+        NodeDistFartherT(float d_in, int id_in) : d(d_in), id(id_in) {}
+        bool operator<(const NodeDistFartherT& obj1) const {
+            // priority_queue here keeps the "best" element at the top so we
+            // can process the nearest candidate first. For CMax (distance)
+            // the best is the smallest d; for CMin (similarity) the best is
+            // the largest d. Equivalent to: d "better than" obj1.d.
+            return CT::cmp(d, obj1.d);
         }
     };
+
+    // Back-compat aliases: default to the distance (CMax) comparator so
+    // existing call sites that mention `HNSW::NodeDist*` keep working.
+    using NodeDistCloser = NodeDistCloserT<C_distance>;
+    using NodeDistFarther = NodeDistFartherT<C_distance>;
 
     /// assignment probability to each layer (sum=1)
     std::vector<double> assign_probas;
@@ -128,8 +154,20 @@ struct HNSW {
     /// use bounded queue during exploration
     bool search_bounded_queue = true;
 
-    /// use Panorama progressive pruning in search
-    bool is_panorama = false;
+    /// Specialized level-0 search implementations. This state is derived from
+    /// the owning IndexHNSW subtype after construction or deserialization.
+    enum Search_method_t : uint8_t {
+        SM_DEFAULT,
+        SM_PANORAMA,
+        SM_RABITQ,
+    };
+    Search_method_t search_method = SM_DEFAULT;
+
+    /// distance comparison semantics: when true, distances are treated as
+    /// similarity scores (larger is better). Default false matches the
+    /// historical L2/Hamming behavior (smaller is better).
+    /// Not serialized: must be re-set by the owning Index after loading.
+    bool is_similarity = false;
 
     // See impl/VisitedTable.h.
     std::optional<bool> use_visited_hashset;
@@ -174,14 +212,27 @@ struct HNSW {
             VisitedTable& vt,
             bool keep_max_size_level0 = false);
 
-    /** add point pt_id on all levels <= pt_level and build the link
-     * structure for them. */
-    void add_with_locks(
+    /** Deterministic build, phase A: write pt_id's forward links against an
+     * immutable snapshot, touching only pt_id's own slots. Reciprocal edges
+     * are collected in `pt_reverse_edges` for phase B, not applied. Requires
+     * entry_point set. */
+    void compute_forward_links_deterministic(
             DistanceComputer& ptdis,
             int pt_level,
-            int pt_id,
-            LockVector& locks,
+            storage_idx_t pt_id,
             VisitedTable& vt,
+            std::vector<std::pair<storage_idx_t, int>>& pt_reverse_edges,
+            bool keep_max_size_level0 = false);
+
+    /** Deterministic build, phase B: merge `incoming` into `node` and
+     * re-prune in a total order (distance, ties by id) so the result is
+     * order-independent. Touches only `node`'s slots; `incoming` is sorted
+     * and deduplicated in place. */
+    void merge_reverse_links_deterministic(
+            DistanceComputer& dis,
+            storage_idx_t node,
+            int level,
+            std::vector<storage_idx_t>& incoming,
             bool keep_max_size_level0 = false);
 
     /// Search interface for 1 point, single thread
@@ -216,15 +267,34 @@ struct HNSW {
 
     int prepare_level_tab(size_t n, bool preset_levels = false);
 
+    template <class C = C_distance>
     static void shrink_neighbor_list(
             DistanceComputer& qdis,
-            std::priority_queue<NodeDistFarther>& input,
-            std::vector<NodeDistFarther>& output,
+            std::priority_queue<NodeDistFartherT<C>>& input,
+            std::vector<NodeDistFartherT<C>>& output,
             size_t max_size,
             bool keep_max_size_level0 = false);
 
     void permute_entries(const idx_t* map);
 };
+
+/** Deterministic, lock-free HNSW graph build. This is the only graph build
+ * that add() uses, and it is shared by IndexHNSW and
+ * IndexBinaryHNSW. The callbacks let both share the algorithm:
+ * `make_distance_computer()` returns a fresh DistanceComputer per thread
+ * (caller-owned) and `set_query(dc, pt_id)` points it at pt_id's vector. */
+void hnsw_add_vertices_deterministic(
+        HNSW& hnsw,
+        size_t n0,
+        size_t n,
+        int d,
+        bool init_level0,
+        bool keep_max_size_level0,
+        bool preset_levels,
+        bool verbose,
+        const std::function<DistanceComputer*()>& make_distance_computer,
+        const std::function<void(DistanceComputer&, HNSW::storage_idx_t)>&
+                set_query);
 
 struct HNSWStats {
     size_t n1 = 0; /// number of vectors searched
@@ -249,6 +319,11 @@ struct HNSWStats {
 
 // global var that collects them all
 FAISS_API extern HNSWStats hnsw_stats;
+
+/// Internal HNSW algorithm helpers. These are not part of the public API; they
+/// are exposed here only so that unit tests (and a few cross-TU callers such as
+/// the Panorama search variant) can reach them.
+namespace hnsw_detail {
 
 int search_from_candidates(
         const HNSW& hnsw,
@@ -301,5 +376,7 @@ void search_neighbors_to_add(
         int level,
         VisitedTable& vt,
         bool reference_version = false);
+
+} // namespace hnsw_detail
 
 } // namespace faiss

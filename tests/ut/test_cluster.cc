@@ -18,7 +18,9 @@
 #include "catch2/generators/catch_generators.hpp"
 #include "faiss/Clustering.h"
 #include "faiss/IndexFlat.h"
+#include "faiss/SuperKMeans.h"
 #include "faiss/cppcontrib/knowhere/utils/binary_distances.h"
+#include "faiss/impl/ClusteringHelpers.h"
 #include "hnswlib/hnswalg.h"
 #include "knowhere/bitsetview.h"
 #include "knowhere/cluster/cluster_factory.h"
@@ -141,5 +143,106 @@ TEST_CASE("Test Kmeans With Float Vector", "[float metrics]") {
         float recall = GetKNNRecall(*gt.value(), result, nprobes);
         LOG_KNOWHERE_INFO_ << "recall: " << recall;
         REQUIRE(recall > kKnnRecallThreshold);
+    }
+}
+
+// Spherical training must return the requested number of unit-normalized centroids.
+TEST_CASE("Test SuperKMeans Spherical", "[cluster]") {
+    const int d = 64;
+    const int k = 16;
+    const size_t n = 256;
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> dist(0.f, 1.f);
+    std::vector<float> x(n * d);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+
+    faiss::SuperKMeansParameters sp;
+    sp.seed = 42;
+    sp.niter = 2;
+    sp.spherical = true;
+    faiss::SuperKMeans sc(d, k, sp);
+    REQUIRE_NOTHROW(sc.train(n, x.data()));
+    REQUIRE(sc.centroids.size() == static_cast<size_t>(k * d));
+
+    // Centroids must be unit norm under spherical clustering.
+    for (int j = 0; j < k; ++j) {
+        float norm = 0.f;
+        for (int i = 0; i < d; ++i) {
+            norm += sc.centroids[j * d + i] * sc.centroids[j * d + i];
+        }
+        norm = std::sqrt(norm);
+        REQUIRE(norm == Catch::Approx(1.f).margin(1e-4));
+    }
+}
+
+TEST_CASE("Test SuperKMeans with 256 centroids", "[cluster]") {
+    constexpr int d = 64;
+    constexpr int k = 256;
+    constexpr size_t n = 1024;
+
+    std::mt19937 rng(43);
+    std::normal_distribution<float> dist(0.f, 1.f);
+    std::vector<float> x(n * d);
+    for (auto& v : x) {
+        v = dist(rng);
+    }
+
+    faiss::SuperKMeansParameters sp;
+    sp.seed = 43;
+    sp.niter = 2;
+    faiss::SuperKMeans clustering(d, k, sp);
+    REQUIRE_NOTHROW(clustering.train(n, x.data()));
+    REQUIRE(clustering.centroids.size() == static_cast<size_t>(k * d));
+}
+
+TEST_CASE("SuperKMeans subsampled training matches explicitly sampled input", "[cluster][superkmeans][upgrade]") {
+    constexpr int d = 64, k = 16, n = 2048;
+    const bool subsample = GENERATE(false, true);
+    const bool faster = GENERATE(false, true);
+    const bool spherical = GENERATE(false, true);
+    CAPTURE(subsample, faster, spherical);
+    std::mt19937 rng(2048);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(n * d);
+    for (auto& v : x) v = normal(rng);
+    const auto original = x;
+    faiss::SuperKMeansParameters cp;
+    cp.seed = 71;
+    cp.niter = 4;
+    cp.min_points_per_centroid = 1;
+    cp.max_points_per_centroid = subsample ? 16 : n;
+    cp.use_faster_subsampling = faster;
+    cp.spherical = spherical;
+    faiss::idx_t reference_n = n;
+    const float* reference_x = x.data();
+    std::unique_ptr<uint8_t[]> sampled;
+    if (subsample) {
+        faiss::Clustering sampling_config(d, k, cp);
+        uint8_t* data = nullptr;
+        float* weights = nullptr;
+        reference_n =
+            faiss::detail::subsample_training_set(sampling_config, n, reinterpret_cast<const uint8_t*>(x.data()),
+                                                  d * sizeof(float), nullptr, &data, &weights);
+        sampled.reset(data);
+        REQUIRE(weights == nullptr);
+        REQUIRE(reference_n == k * cp.max_points_per_centroid);
+        reference_x = reinterpret_cast<const float*>(sampled.get());
+    }
+    faiss::SuperKMeans actual(d, k, cp), reference(d, k, cp);
+    actual.train(n, x.data());
+    reference.train(reference_n, reference_x);
+    REQUIRE(x == original);
+    REQUIRE(actual.iteration_stats.size() == static_cast<size_t>(cp.niter));
+    REQUIRE(actual.centroids.size() == static_cast<size_t>(k * d));
+    for (size_t i = 0; i < actual.centroids.size(); ++i) {
+        REQUIRE(std::isfinite(actual.centroids[i]));
+        REQUIRE(actual.centroids[i] == Catch::Approx(reference.centroids[i]).margin(1e-5));
+    }
+    for (size_t i = 0; i < actual.iteration_stats.size(); ++i) {
+        REQUIRE(std::isfinite(actual.iteration_stats[i].obj));
+        REQUIRE(actual.iteration_stats[i].obj == Catch::Approx(reference.iteration_stats[i].obj).epsilon(1e-5));
     }
 }

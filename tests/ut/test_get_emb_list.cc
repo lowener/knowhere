@@ -227,6 +227,7 @@ TEST_CASE("Test GetEmbListByIds with variable-length embedding lists", "[GetEmbL
 
         auto result_ds = result.value();
         auto result_offsets = result_ds->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET);
+        REQUIRE(result_ds->Get<int64_t>(knowhere::meta::EMB_LIST_COUNT) == ids_ds->GetRows());
         size_t el_len = result_offsets[1] - result_offsets[0];
         REQUIRE(el_len == (original_offsets[el_id + 1] - original_offsets[el_id]));
 
@@ -249,6 +250,7 @@ TEST_CASE("Test GetEmbListByIds with variable-length embedding lists", "[GetEmbL
 
         auto result_ds = result.value();
         auto result_offsets = result_ds->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET);
+        REQUIRE(result_ds->Get<int64_t>(knowhere::meta::EMB_LIST_COUNT) == ids_ds->GetRows());
         REQUIRE(result_offsets[0] == 0);
         REQUIRE(result_offsets[1] == 0);
     }
@@ -323,7 +325,7 @@ TEST_CASE("Test GetEmbListByIds error cases", "[GetEmbListByIds]") {
         REQUIRE(!result.has_value());
     }
 
-    SECTION("Error when el_id out of range") {
+    SECTION("Empty result when el_id is out of range") {
         auto train_ds = GenEmbListDataSet(nb, dim, 42, each_el_len);
         auto idx =
             knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
@@ -333,10 +335,11 @@ TEST_CASE("Test GetEmbListByIds error cases", "[GetEmbListByIds]") {
         int64_t boundary_el_id = num_el;
         auto ids_ds = knowhere::GenIdsDataSet(1, &boundary_el_id);
         auto result = idx.GetEmbListByIds(ids_ds, knowhere::metric::MAX_SIM_COSINE);
-        REQUIRE(!result.has_value());
+        REQUIRE(result.has_value());
+        REQUIRE(result.value()->GetRows() == 0);
     }
 
-    SECTION("Error when el_id is negative") {
+    SECTION("Empty result when el_id is negative") {
         auto train_ds = GenEmbListDataSet(nb, dim, 42, each_el_len);
         auto idx =
             knowhere::IndexFactory::Instance().Create<knowhere::fp32>(knowhere::IndexEnum::INDEX_HNSW, version).value();
@@ -346,7 +349,8 @@ TEST_CASE("Test GetEmbListByIds error cases", "[GetEmbListByIds]") {
         int64_t bad_el_id = -1;
         auto ids_ds = knowhere::GenIdsDataSet(1, &bad_el_id);
         auto result = idx.GetEmbListByIds(ids_ds, knowhere::metric::MAX_SIM_COSINE);
-        REQUIRE(!result.has_value());
+        REQUIRE(result.has_value());
+        REQUIRE(result.value()->GetRows() == 0);
     }
 
     SECTION("Error when metric_type is invalid") {

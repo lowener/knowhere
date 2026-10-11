@@ -38,8 +38,13 @@ template <typename DataType, QuantType quant_type = QuantType::None>
 class HnswIndexNode : public IndexNode {
  public:
     using DistType = float;
-    HnswIndexNode(const int32_t& /*version*/, const Object& object) : index_(nullptr) {
+    HnswIndexNode(const int32_t& version, const Object& object) : IndexNode(version), index_(nullptr) {
         search_pool_ = ThreadPool::GetGlobalSearchThreadPool();
+    }
+
+    bool
+    NeedBitsetExactCount() const override {
+        return true;
     }
 
     Status
@@ -255,6 +260,7 @@ class HnswIndexNode : public IndexNode {
         WaitAllSuccess(futs);
 
         auto res = GenResultDataSet(nq, k, std::move(p_id), std::move(p_dist));
+        MapSearchResultIdsToOutIds(res);
 
         // set visit_info json string into result dataset
         if (feder_result != nullptr) {
@@ -327,11 +333,14 @@ class HnswIndexNode : public IndexNode {
         bool transform =
             (index_->metric_type_ == hnswlib::Metric::INNER_PRODUCT || index_->metric_type_ == hnswlib::Metric::COSINE);
         auto vec = std::vector<IndexNode::IteratorPtr>(nq, nullptr);
+        const auto& id_map = this->GetIdMap();
+        const auto* result_id_map = this->SearchResultIdMap(id_map);
         try {
             for (int i = 0; i < nq; ++i) {
                 auto single_query = (const char*)xq + i * index_->data_size_;
                 auto it = std::make_shared<iterator>(this->index_, single_query, transform, bitset, ef,
                                                      hnsw_cfg.iterator_refine_ratio.value(), use_knowhere_search_pool);
+                it->SetResultIdMap(result_id_map);
                 vec[i] = it;
             }
         } catch (const std::exception& e) {
@@ -409,6 +418,7 @@ class HnswIndexNode : public IndexNode {
             res->SetJsonInfo(json_visit_info.dump());
             res->SetJsonIdSet(json_id_set.dump());
         }
+        MapSearchResultIdsToOutIds(res);
         return res;
     }
 

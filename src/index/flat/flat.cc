@@ -140,13 +140,20 @@ class FlatIndexNode : public IndexNode {
             }
             // wait for the completion
             WaitAllSuccess(futs);
+        } catch (const folly::FutureCancellation& e) {
+            std::unique_ptr<int64_t[]> auto_delete_ids(ids);
+            std::unique_ptr<float[]> auto_delete_dis(distances);
+            LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+            return expected<DataSetPtr>::Err(Status::cancelled, e.what());
         } catch (const std::exception& e) {
             std::unique_ptr<int64_t[]> auto_delete_ids(ids);
             std::unique_ptr<float[]> auto_delete_dis(distances);
             LOG_KNOWHERE_WARNING_ << "error inner faiss: " << e.what();
             return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
         }
-        return GenResultDataSet(nq, k, ids, distances);
+        auto res = GenResultDataSet(nq, k, ids, distances);
+        MapSearchResultIdsToOutIds(res);
+        return res;
     }
 
     expected<DataSetPtr>
@@ -226,14 +233,32 @@ class FlatIndexNode : public IndexNode {
             return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
         }
 
-        return GenResultDataSet(nq, std::move(range_search_result));
+        auto res = GenResultDataSet(nq, std::move(range_search_result));
+        MapSearchResultIdsToOutIds(res);
+        return res;
     }
 
     expected<DataSetPtr>
     GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override {
+        if (dataset == nullptr) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds dataset is null");
+        }
         auto dim = Dim();
         auto rows = dataset->GetRows();
         auto ids = dataset->GetIds();
+        std::vector<int64_t> in_ids;
+        auto status = this->CompactOutToIn(ids, rows, in_ids);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
+        }
+        ids = in_ids.data();
+        rows = static_cast<int64_t>(in_ids.size());
+        if (rows == 0) {
+            // Public-id retrieve may compact missing nullable ids to an empty
+            // storage-id set. Return an empty vector result without touching
+            // backend storage.
+            return GenResultDataSet(0, dim, nullptr);
+        }
         if constexpr (std::is_same_v<IndexType, faiss::cppcontrib::knowhere::IndexFlat>) {
             DataType* data = nullptr;
             try {

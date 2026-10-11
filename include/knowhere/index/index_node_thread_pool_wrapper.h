@@ -46,9 +46,20 @@ class IndexNodeThreadPoolWrapper : public IndexNode {
         return index_node_->GetVectorByIds(dataset, op_context);
     }
 
+    expected<DataSetPtr>
+    GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_type,
+                    milvus::OpContext* op_context) const override {
+        return index_node_->GetEmbListByIds(dataset, metric_type, op_context);
+    }
+
     bool
     HasRawData(const std::string& metric_type) const override {
         return index_node_->HasRawData(metric_type);
+    }
+
+    bool
+    IsIndexRefineEnabled() const override {
+        return index_node_->IsIndexRefineEnabled();
     }
 
     expected<DataSetPtr>
@@ -89,6 +100,46 @@ class IndexNodeThreadPoolWrapper : public IndexNode {
     int64_t
     Count() const override {
         return index_node_->Count();
+    }
+
+    bool
+    NeedBitsetExactCount() const override {
+        return index_node_->NeedBitsetExactCount();
+    }
+
+    IdMap&
+    GetIdMap() override {
+        return index_node_->GetIdMap();
+    }
+
+    const IdMap&
+    GetIdMap() const override {
+        return index_node_->GetIdMap();
+    }
+
+    void
+    SetIdMapType(IdMap::Type type) override {
+        index_node_->SetIdMapType(type);
+    }
+
+    int64_t
+    MapOutToIn(int64_t out_id) const override {
+        return index_node_->MapOutToIn(out_id);
+    }
+
+    Status
+    CompactOutToIn(const int64_t* out_ids, size_t count, std::vector<int64_t>& compact_ids) const override {
+        return index_node_->CompactOutToIn(out_ids, count, compact_ids);
+    }
+
+    expected<PreparedBitset>
+    PrepareBitset(BitsetView bitset) const override {
+        return index_node_->PrepareBitset(bitset);
+    }
+
+    Status
+    FinalizeIdMap() override {
+        return index_node_->FinalizeIdMap();
     }
 
     std::string

@@ -20,6 +20,7 @@
 #include "catch2/catch_test_macros.hpp"
 #include "catch2/generators/catch_generators.hpp"
 #include "diskann/diskann_gpu.h"
+#include "diskann/utils.h"
 #include "filemanager/FileManager.h"
 #include "filemanager/impl/LocalFileManager.h"
 #include "index/diskann/diskann_config.h"
@@ -377,6 +378,20 @@ base_search() {
                 }
             }
 
+            // A fully filtered search returns before doing any I/O. Verify that
+            // the early return still restores the scratch slot to thread_data;
+            // cal_size() includes the number of currently available slots.
+            auto fully_filtered_query = knowhere::ConvertToDataTypeIfNeeded<DataType>(GenDataSet(1, kDim, 43));
+            auto fully_filtered_data = GenerateBitsetWithFirstTbitsSet(kNumRows, kNumRows);
+            knowhere::BitsetView fully_filtered_bitset(fully_filtered_data.data(), kNumRows);
+            const auto size_before_fully_filtered_search = diskann.Size();
+            auto fully_filtered_results = diskann.Search(fully_filtered_query, knn_json, fully_filtered_bitset);
+            REQUIRE(fully_filtered_results.has_value());
+            for (uint32_t i = 0; i < kK; ++i) {
+                REQUIRE(fully_filtered_results.value()->GetIds()[i] == -1);
+            }
+            REQUIRE(diskann.Size() == size_before_fully_filtered_search);
+
             // range search process
             auto range_search_json = range_search_gen().dump();
             knowhere::Json range_json = knowhere::Json::parse(range_search_json);
@@ -393,6 +408,70 @@ base_search() {
 
 TEST_CASE("Test DiskANNIndexNode.", "[diskann]") {
     base_search<knowhere::fp32>();
+}
+
+TEST_CASE("Test DiskANN CalcDistByIDs with all vectors cached", "[diskann]") {
+    fs::remove_all(kDir);
+    REQUIRE_NOTHROW(fs::create_directories(kCOSINEIndexDir));
+
+#ifdef KNOWHERE_WITH_CARDINAL
+    // This case verifies native DiskANN's cached-node file contract.
+    // Cardinal-backed DISKANN keeps its cache inside Cardinal storage instead.
+    constexpr const char* diskann_type = "DISKANN_DEPRECATED";
+#else
+    constexpr const char* diskann_type = "DISKANN";
+#endif
+
+    auto version = GenTestVersionList();
+    auto base_ds = knowhere::ConvertToDataTypeIfNeeded<knowhere::fp16>(GenDataSet(kNumRows, kDim, 30));
+    auto base_ptr = static_cast<const knowhere::fp16*>(base_ds->GetTensor());
+    WriteRawDataToDisk<knowhere::fp16>(kRawDataPath, base_ptr, kNumRows, kDim);
+
+    knowhere::Json build_json;
+    build_json["dim"] = kDim;
+    build_json["metric_type"] = knowhere::metric::COSINE;
+    build_json["index_prefix"] = kCOSINEIndexPrefix;
+    build_json["data_path"] = kRawDataPath;
+    build_json["max_degree"] = 56;
+    build_json["search_list_size"] = 128;
+    build_json["pq_code_budget_gb"] = sizeof(knowhere::fp16) * kDim * kNumRows * 0.125 / (1024 * 1024 * 1024);
+    build_json["search_cache_budget_gb"] = sizeof(knowhere::fp16) * kDim * kNumRows * 0.125 / (1024 * 1024 * 1024);
+    build_json["build_dram_budget_gb"] = 32.0;
+
+    std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+    auto diskann_index_pack = knowhere::Pack(file_manager);
+    auto diskann =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp16>(diskann_type, version, diskann_index_pack).value();
+    REQUIRE(diskann.Build(nullptr, build_json) == knowhere::Status::success);
+
+    knowhere::BinarySet binset;
+    REQUIRE(diskann.Serialize(binset) == knowhere::Status::success);
+
+    knowhere::Json deserialize_json;
+    deserialize_json["dim"] = kDim;
+    deserialize_json["metric_type"] = knowhere::metric::COSINE;
+    deserialize_json["index_prefix"] = kCOSINEIndexPrefix;
+    deserialize_json["search_cache_budget_gb"] = build_json["search_cache_budget_gb"];
+
+    auto loaded_diskann =
+        knowhere::IndexFactory::Instance().Create<knowhere::fp16>(diskann_type, version, diskann_index_pack).value();
+    REQUIRE(loaded_diskann.Deserialize(binset, deserialize_json) == knowhere::Status::success);
+
+    std::unique_ptr<uint32_t[]> cached_ids;
+    size_t num_cached_ids = 0;
+    size_t cached_id_dim = 0;
+    diskann::load_bin<uint32_t>(diskann::get_cached_nodes_file(kCOSINEIndexPrefix), cached_ids, num_cached_ids,
+                                cached_id_dim);
+    REQUIRE(num_cached_ids > 0);
+    REQUIRE(cached_id_dim == 1);
+
+    const int64_t cached_id = cached_ids[0];
+    auto query_ds = knowhere::GenDataSet(1, kDim, base_ptr + cached_id * kDim);
+    auto result = loaded_diskann.CalcDistByIDs(query_ds, nullptr, &cached_id, 1, true);
+    REQUIRE(result.has_value());
+    REQUIRE(result.value()->GetDistance()[0] == Catch::Approx(1.0f).margin(0.001f));
+
+    fs::remove_all(kDir);
 }
 
 #ifdef KNOWHERE_WITH_CUVS
@@ -838,7 +917,8 @@ TEST_CASE("Test_AiSAQ_dynamic_cache", "[diskann]") {
              read_page_cache_size += 4096) {
             knn_json["pq_read_page_cache_size"] = read_page_cache_size;
             auto start = std::chrono::high_resolution_clock::now();
-            diskann.Search(query_ds, knn_json, nullptr);
+            auto loop_results = diskann.Search(query_ds, knn_json, nullptr);
+            REQUIRE(loop_results.has_value());
             auto end = std::chrono::high_resolution_clock::now();
             auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
             std::cout << "*********************** Run time: " << duration.count() << " ms"
@@ -1760,10 +1840,11 @@ TEST_CASE("Test DiskANN Search Cancellation", "[diskann][cancellation]") {
 
         auto results = diskann.Search(query_ds, search_gen(), nullptr, &op_context);
         REQUIRE(!results.has_value());
-        // DISKANN returns diskann_inner_error, AISAQ returns aisaq_error
-        auto expected_error =
-            (index_type == "AISAQ") ? knowhere::Status::aisaq_error : knowhere::Status::diskann_inner_error;
-        REQUIRE((results.error() == expected_error || results.error() == knowhere::Status::cardinal_inner_error));
+        // A cancellation the caller asked for is reported as such, not as a
+        // DiskANN or AiSAQ engine failure. Cardinal still reports its own
+        // inner error until the matching change lands there.
+        REQUIRE((results.error() == knowhere::Status::cancelled ||
+                 results.error() == knowhere::Status::cardinal_inner_error));
     }
 
     SECTION("Test Search without cancellation should succeed") {

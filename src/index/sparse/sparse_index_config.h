@@ -12,6 +12,12 @@
 #ifndef SPARSE_INVERTED_INDEX_CONFIG_H
 #define SPARSE_INVERTED_INDEX_CONFIG_H
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <limits>
+#include <string>
+
 // Compile-time option: index versions below this threshold use raw data format; others use codec.
 // Default is 8. Override at compile time, e.g. -DSPARSE_INDEX_VERSION_USE_RAW_DATA_THRESHOLD=10
 #ifndef SPARSE_INDEX_VERSION_USE_RAW_DATA_THRESHOLD
@@ -29,20 +35,66 @@
 
 namespace knowhere {
 
+inline std::string
+NormalizeSparseInvertedIndexAlgo(std::string algo) {
+    std::transform(algo.begin(), algo.end(), algo.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    return algo;
+}
+
+inline bool
+IsSupportedSparseInvertedIndexAlgo(const std::string& algo) {
+    const auto normalized_algo = NormalizeSparseInvertedIndexAlgo(algo);
+    return normalized_algo.empty() || normalized_algo == "TAAT_NAIVE" || normalized_algo == "DAAT_WAND" ||
+           normalized_algo == "DAAT_MAXSCORE" || normalized_algo == "BLOCK_MAX_MAXSCORE" ||
+           normalized_algo == "BLOCK_MAX_WAND" || normalized_algo == "SINDI";
+}
+
+inline bool
+IsSupportedSparseInvertedIndexCodec(const std::string& codec) {
+    return codec.empty() || codec == "block_streamvbyte" || codec == "block_maskedvbyte" || codec == "block_adaptive";
+}
+
 class SparseInvertedIndexConfig : public BaseConfig {
  public:
     CFG_FLOAT drop_ratio_build;
     CFG_FLOAT drop_ratio_search;
     CFG_INT refine_factor;
+    // Keep the legacy integer field: changing its type is not assumed ABI-compatible.
+    // Match HNSW's floating-point multiplier, including fractional pool sizes.
+    CFG_BOOL refine;
+    CFG_FLOAT refine_k;
+    CFG_FLOAT refine_query_mass_percentage;
     CFG_FLOAT dim_max_score_ratio;
+    CFG_INT bulk_query_nnz_threshold;
     CFG_INT block_max_block_size;
     CFG_STRING inverted_index_algo;
     CFG_STRING inverted_index_codec;
     CFG_STRING search_algo;
     CFG_STRING quant_type;
+    CFG_FLOAT bm25_u8_max_overflow_ratio;
     CFG_INT sindi_window_size;
 
     KNOWHERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
+        KNOWHERE_CONFIG_DECLARE_FIELD(refine)
+            .description("build SINDI IP full-query refinement support")
+            .set_default(false)
+            .for_train()
+            .for_static();
+        KNOWHERE_CONFIG_DECLARE_FIELD(refine_k)
+            .description("SINDI coarse candidate multiplier; ceil(k * refine_k)")
+            .set_default(1.0f)
+            .set_range(1.0f, std::numeric_limits<float>::max())
+            .for_search()
+            .for_range_search()
+            .for_iterator();
+        KNOWHERE_CONFIG_DECLARE_FIELD(refine_query_mass_percentage)
+            .description("coarse query retained weight mass fraction in (0,1], applied to indexed dimensions")
+            .set_default(1.0f)
+            .set_range(0.0f, 1.0f, false, true)
+            .for_search()
+            .for_range_search()
+            .for_iterator();
         // NOTE: drop_ratio_build has been deprecated, it won't change anything
         KNOWHERE_CONFIG_DECLARE_FIELD(drop_ratio_build)
             .description("drop ratio for build")
@@ -56,17 +108,10 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .for_search()
             .for_range_search()
             .for_iterator();
-        /**
-         * refine_factor is used for approximate search.
-         * refine_factor == 1 means no refinement, and is the default value.
-         * refine_factor > 1 means refinement. The larger the value, the more
-         * accurate the approximate result will be, but the slower the
-         * performance.
-         * Be aware that if you opt to use a large drop_ratio_search, it is
-         * necessary for you to manually modify this value.
-         */
+        // Legacy compatibility field. Current sparse search does not consume it;
+        // SINDI refinement uses the separate floating-point refine_k parameter.
         KNOWHERE_CONFIG_DECLARE_FIELD(refine_factor)
-            .description("refine factor for approximate search")
+            .description("legacy unused integer multiplier; SINDI refinement uses refine_k")
             .set_default(1)
             .for_search();
         /**
@@ -99,6 +144,11 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .set_default(1.05)
             .description("ratio to upscale/downscale the max score of each dimension")
             .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(bulk_query_nnz_threshold)
+            .description("minimum effective query nnz to use bulk-window MaxScore scoring")
+            .set_default(20)
+            .set_range(0, std::numeric_limits<CFG_INT::value_type>::max())
+            .for_search();
         KNOWHERE_CONFIG_DECLARE_FIELD(search_algo)
             .set_default("INHERIT")
             .description("search algorithm")
@@ -120,24 +170,71 @@ class SparseInvertedIndexConfig : public BaseConfig {
         KNOWHERE_CONFIG_DECLARE_FIELD(block_max_block_size)
             .description("block max block size")
             .set_default(128)
+            .set_range(1, std::numeric_limits<CFG_INT::value_type>::max())
             .for_train()
             .for_deserialize()
             .for_deserialize_from_file();
         KNOWHERE_CONFIG_DECLARE_FIELD(quant_type)
-            .description("quantization type for posting list values: fp16/fp32 for IP, u16/u32 for BM25")
+            .description(
+                "quantization type for posting list values: fp16/fp32 for IP, u8/u16/u32/auto for BM25; u8 is "
+                "supported only by sealed SINDI with index version >= 11; BM25 auto requires index version >= 11 "
+                "and resolves to u8/u16 for sealed SINDI or u16 for other indexes; the concrete type is persisted "
+                "in the index and restored automatically on load; the load parameter is used only for legacy "
+                "files without posting-type metadata")
             .allow_empty_without_default()
             .for_train()
             .for_deserialize()
             .for_deserialize_from_file();
+        KNOWHERE_CONFIG_DECLARE_FIELD(bm25_u8_max_overflow_ratio)
+            .description(
+                "maximum overflow-posting ratio at which SINDI BM25 quant_type=auto selects restore-u8; 0.0001 "
+                "means 0.01%")
+            .set_default(0.0001f)
+            .set_range(0.0f, 1.0f)
+            .for_train();
         KNOWHERE_CONFIG_DECLARE_FIELD(sindi_window_size)
             .description("window size for sindi inverted index")
             .set_range(1024, 65535)
-            .set_default(65535)
+            .set_default(4096)
             .for_train();
     }
 
     Status
     CheckAndAdjust(PARAM_TYPE param_type, std::string* err_msg) override {
+        const float mass = refine_query_mass_percentage.value_or(1.0f);
+        const float factor = refine_k.value_or(1.0f);
+        if (!std::isfinite(mass) || mass <= 0 || mass > 1 || !std::isfinite(factor) || factor < 1) {
+            return HandleError(err_msg, "Invalid refine_query_mass_percentage or refine_k", Status::invalid_args);
+        }
+        if ((param_type & (RANGE_SEARCH | ITERATOR)) && (mass != 1 || factor != 1)) {
+            return HandleError(err_msg, "SINDI refinement controls support top-k search only", Status::invalid_args);
+        }
+
+        if (inverted_index_algo.has_value() && !IsSupportedSparseInvertedIndexAlgo(inverted_index_algo.value())) {
+            return HandleError(
+                err_msg,
+                "inverted_index_algo " + inverted_index_algo.value() +
+                    " not found or not supported, supported: [TAAT_NAIVE DAAT_WAND DAAT_MAXSCORE BLOCK_MAX_MAXSCORE "
+                    "BLOCK_MAX_WAND SINDI]",
+                Status::invalid_args);
+        }
+        if (inverted_index_codec.has_value() && !IsSupportedSparseInvertedIndexCodec(inverted_index_codec.value())) {
+            return HandleError(err_msg,
+                               "inverted_index_codec " + inverted_index_codec.value() +
+                                   " not found or not supported, supported: [block_streamvbyte block_maskedvbyte "
+                                   "block_adaptive]",
+                               Status::invalid_args);
+        }
+        // On load, the serialized type takes precedence. Validate the caller's
+        // quant_type later, only if a legacy file actually needs that parameter.
+        if (param_type & (DESERIALIZE | DESERIALIZE_FROM_FILE)) {
+            return Status::success;
+        }
+        return ValidateQuantType(err_msg);
+    }
+
+    Status
+    ValidateQuantType(std::string* err_msg) const {
         if (quant_type.has_value() && !quant_type.value().empty()) {
             auto qt = quant_type.value();
             auto mt = metric_type.value();
@@ -149,9 +246,9 @@ class SparseInvertedIndexConfig : public BaseConfig {
                     return Status::invalid_args;
                 }
             } else if (mt == metric::BM25) {
-                if (qt != "u16" && qt != "u32") {
+                if (qt != "u8" && qt != "u16" && qt != "u32" && qt != "auto") {
                     if (err_msg) {
-                        *err_msg = "quant_type for BM25 metric must be 'u16' or 'u32', got '" + qt + "'";
+                        *err_msg = "quant_type for BM25 metric must be 'u8', 'u16', 'u32', or 'auto', got '" + qt + "'";
                     }
                     return Status::invalid_args;
                 }

@@ -21,6 +21,7 @@ typedef uint64_t size_t;
 %{
 #include <stdint.h>
 #include <memory>
+#include <stdexcept>
 #ifdef SWIGPYTHON
 #undef popcount64
 #define SWIG_FILE_WITH_INIT
@@ -148,11 +149,19 @@ class AnnIteratorWrap {
     }
 
     bool HasNext() {
-        return it_->HasNext();
+        auto has_next = it_->HasNext();
+        if (!has_next.has_value()) {
+            throw std::runtime_error("ann iterator HasNext failed: " + has_next.what());
+        }
+        return has_next.value();
     }
 
     std::pair<int64_t, float> Next() {
-        return it_->Next();
+        auto next = it_->Next();
+        if (!next.has_value()) {
+            throw std::runtime_error("ann iterator Next failed: " + next.what());
+        }
+        return next.value();
     }
 
  private:
@@ -322,11 +331,15 @@ GetNullBitSetView() {
 };
 
 void setOffsets(knowhere::DataSetPtr ds, int* offsets, int offset_size) {
+    if (offset_size <= 0) {
+        throw std::invalid_argument("embedding-list offsets must contain at least the initial offset");
+    }
     size_t* offsets_ = new size_t[offset_size];
     for (int i = 0; i < offset_size; ++i) {
         offsets_[i] = (size_t)(offsets[i]);
     }
     ds->Set(knowhere::meta::EMB_LIST_OFFSET, const_cast<const size_t*>(offsets_));
+    ds->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(offset_size - 1));
 }
 
 knowhere::DataSetPtr

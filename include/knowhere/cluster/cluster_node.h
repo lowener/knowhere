@@ -14,6 +14,7 @@
 
 #include "knowhere/binaryset.h"
 #include "knowhere/bitsetview.h"
+#include "knowhere/cluster/compaction_result.h"
 #include "knowhere/config.h"
 #include "knowhere/dataset.h"
 #include "knowhere/expected.h"
@@ -28,15 +29,43 @@ class ClusterNode : public Object {
     virtual expected<DataSetPtr>
     Train(const DataSet& dataset, const Config& cfg) = 0;
 
-    // cluster assign, return id_mapping
-    // (rows, uint32_t* id_mapping)
+    // Legacy assignment returns uint32 centroid IDs in TENSOR.
     virtual expected<DataSetPtr>
     Assign(const DataSet& dataset) = 0;
+
+    virtual expected<DataSetPtr>
+    Assign(const DataSet& dataset, const Config& cfg) {
+        (void)cfg;
+        return Assign(dataset);
+    }
+
+    // Explicit extension: int64 IDS and float squared-L2 DISTANCE to the chosen
+    // centroid. Index-based assignment forwards the index search distance, which
+    // may be approximate, and need not select the exact nearest centroid.
+    virtual expected<DataSetPtr>
+    AssignWithDistance(const DataSet& /*dataset*/, const Config& /*cfg*/) {
+        return expected<DataSetPtr>::Err(Status::not_implemented, "AssignWithDistance not implemented");
+    }
+
+    // Counts are indexed by centroid ID, avoiding an O(N) assignment array.
+    // Returns an owned typed result; row bounds are soft for indivisible buckets.
+    virtual expected<CompactionResult>
+    BuildCompactionPlan(const std::vector<uint64_t>& /*centroid_counts*/, const Config& /*cfg*/) {
+        return expected<CompactionResult>::Err(Status::not_implemented, "BuildCompactionPlan not implemented");
+    }
 
     // return centroids, must be called after trained
     // (rows, dim, centroid_vector_list)
     virtual expected<DataSetPtr>
     GetCentroids() const = 0;
+
+    // Inject externally-computed centroids, bypassing Train. After success,
+    // Assign and GetCentroids behave as they do after Train.
+    virtual Status
+    SetCentroids(const DataSet& centroids) {
+        (void)centroids;
+        return Status::not_implemented;
+    }
 
     virtual std::unique_ptr<Config>
     CreateConfig() const = 0;

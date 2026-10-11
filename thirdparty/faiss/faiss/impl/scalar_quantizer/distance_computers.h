@@ -77,6 +77,12 @@ struct DCTemplate<Quantizer, Similarity, SIMDLevel::NONE> : SQDistanceComputer {
 template <class Similarity, SIMDLevel SL>
 struct DistanceComputerByte : SQDistanceComputer {};
 
+// Byte-domain distance computer for QT_8bit_direct_signed (storage is
+// value+128). A level added to the sq-dispatch.h chain without a
+// specialization here instantiates this empty template.
+template <class Similarity, SIMDLevel SL>
+struct DistanceComputerByteSigned : SQDistanceComputer {};
+
 template <class Similarity>
 struct DistanceComputerByte<Similarity, SIMDLevel::NONE> : SQDistanceComputer {
     using Sim = Similarity;

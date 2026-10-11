@@ -11,6 +11,7 @@
 
 #include "knowhere/index/index_node.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <queue>
@@ -81,6 +82,8 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
     const auto nq = its.size();
     std::vector<std::vector<int64_t>> result_id_array(nq);
     std::vector<std::vector<float>> result_dist_array(nq);
+    std::vector<Status> task_status(nq, Status::success);
+    std::vector<std::string> task_msg(nq);
 
     const bool retain_iterator_order = base_cfg.retain_iterator_order.value();
     LOG_KNOWHERE_DEBUG_ << "retain_iterator_order: " << retain_iterator_order;
@@ -95,11 +98,26 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
         checkCancellation(op_context);
 #endif
         auto it = its[idx];
-        while (it->HasNext()) {
+        while (true) {
 #if defined(NOT_COMPILE_FOR_SWIG)
             checkCancellation(op_context);
 #endif
-            auto [id, dist] = it->Next();
+            auto has_next = it->HasNext();
+            if (!has_next.has_value()) {
+                task_status[idx] = has_next.error();
+                task_msg[idx] = has_next.what();
+                return;
+            }
+            if (!has_next.value()) {
+                break;
+            }
+            auto next = it->Next();
+            if (!next.has_value()) {
+                task_status[idx] = next.error();
+                task_msg[idx] = next.what();
+                return;
+            }
+            auto [id, dist] = next.value();
             if (has_closer_bound && too_close(dist)) {
                 continue;
             }
@@ -136,11 +154,26 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
         auto same_or_too_far = [&is_first_closer, &tighter_further_bound](float dist) {
             return !is_first_closer(dist, tighter_further_bound);
         };
-        while (it->HasNext()) {
+        while (true) {
 #if defined(NOT_COMPILE_FOR_SWIG)
             checkCancellation(op_context);
 #endif
-            auto [id, dist] = it->Next();
+            auto has_next = it->HasNext();
+            if (!has_next.has_value()) {
+                task_status[idx] = has_next.error();
+                task_msg[idx] = has_next.what();
+                return;
+            }
+            if (!has_next.value()) {
+                break;
+            }
+            auto next = it->Next();
+            if (!next.has_value()) {
+                task_status[idx] = next.error();
+                task_msg[idx] = next.what();
+                return;
+            }
+            auto [id, dist] = next.value();
             num_next++;
             if (has_closer_bound && too_close(dist)) {
                 continue;
@@ -187,6 +220,9 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
             }
         }
         WaitAllSuccess(futs);
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<DataSetPtr>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         LOG_KNOWHERE_WARNING_ << "range search error: " << e.what();
         return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
@@ -203,6 +239,13 @@ IndexNode::RangeSearch(const DataSetPtr dataset, std::unique_ptr<Config> cfg, co
     }
 #endif
 
+    for (size_t i = 0; i < nq; i++) {
+        if (task_status[i] != Status::success) {
+            LOG_KNOWHERE_WARNING_ << "range search iterator error: " << task_msg[i];
+            return expected<DataSetPtr>::Err(task_status[i], task_msg[i]);
+        }
+    }
+
     auto range_search_result = GetRangeSearchResult(result_dist_array, result_id_array, the_larger_the_closer, nq,
                                                     further_bound, closer_bound);
     return GenResultDataSet(nq, std::move(range_search_result));
@@ -216,16 +259,19 @@ IndexNode::SearchEmbList(const DataSetPtr dataset, std::unique_ptr<Config> cfg, 
         return expected<DataSetPtr>::Err(Status::emb_list_inner_error, "strategy not initialized");
     }
 
-    // 1. Parse query offset
     const size_t* lims = dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET);
     if (lims == nullptr) {
         return expected<DataSetPtr>::Err(Status::emb_list_inner_error, "missing emb_list offset, could not search");
     }
     auto num_q_vecs = static_cast<size_t>(dataset->GetRows());
-    EmbListOffset query_offset(lims, num_q_vecs);
+    EmbListOffset query_offset(lims, num_q_vecs, GetEmbListCount(dataset));
 
-    // 2. Delegate search to strategy
-    return emb_list_strategy_->Search(dataset, query_offset, this, std::move(cfg), bitset, op_context);
+    auto result = emb_list_strategy_->Search(dataset, query_offset, this, std::move(cfg), bitset, op_context);
+    if (result.has_value()) {
+        // Compact list ids -> public list ids.
+        MapEmbListResultIdsToOutIds(result.value());
+    }
+    return result;
 }
 
 expected<DataSetPtr>
@@ -283,38 +329,68 @@ IndexNode::AnnIteratorEmbListIfNeed(const DataSetPtr dataset, std::unique_ptr<Co
 expected<DataSetPtr>
 IndexNode::GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_type,
                            milvus::OpContext* op_context) const {
+    if (dataset == nullptr) {
+        return expected<DataSetPtr>::Err(Status::invalid_args, "GetEmbListByIds dataset is null");
+    }
     if (emb_list_offset_ == nullptr) {
         return expected<DataSetPtr>::Err(Status::emb_list_inner_error,
                                          "GetEmbListByIds requires emb_list_offset, but it is not available");
     }
+
+    std::vector<int64_t> storage_ids;
+    auto status = CompactOutToIn(dataset->GetIds(), dataset->GetRows(), storage_ids);
+    if (status != Status::success) {
+        return expected<DataSetPtr>::Err(status, "GetEmbListByIds failed to map ids");
+    }
+    storage_ids.erase(
+        std::remove_if(storage_ids.begin(), storage_ids.end(),
+                       [this](int64_t id) { return id < 0 || static_cast<size_t>(id) >= emb_list_offset_->num_el(); }),
+        storage_ids.end());
+
+    auto storage_dataset = GenIdsDataSet(storage_ids.size(), storage_ids.data());
+    return GetEmbListByStorageIds(storage_dataset, metric_type, op_context);
+}
+
+expected<DataSetPtr>
+IndexNode::GetEmbListByStorageIds(const DataSetPtr dataset, const std::string& metric_type,
+                                  milvus::OpContext* op_context) const {
+    if (emb_list_offset_ == nullptr) {
+        return expected<DataSetPtr>::Err(Status::emb_list_inner_error,
+                                         "GetEmbListByStorageIds requires emb_list_offset, but it is not available");
+    }
     auto sub_metric = get_sub_metric_type(metric_type);
     if (!sub_metric.has_value()) {
         return expected<DataSetPtr>::Err(Status::not_implemented,
-                                         "GetEmbListByIds: invalid metric type " + metric_type);
+                                         "GetEmbListByStorageIds: invalid metric type " + metric_type);
     }
 
-    // Raw data can come from emb_list_raw_index_ (MUVERA/LEMUR) or base index (TokenANN)
+    // Raw vectors come from strategy-owned storage or the base index.
     bool use_raw_index = (emb_list_raw_index_ != nullptr);
     if (!use_raw_index && !HasRawData(sub_metric.value())) {
         return expected<DataSetPtr>::Err(
             Status::not_implemented,
-            "GetEmbListByIds requires raw data support, but the index does not store raw vectors");
+            "GetEmbListByStorageIds requires raw data support, but the index does not store raw vectors");
     }
 
+    if (dataset == nullptr) {
+        return expected<DataSetPtr>::Err(Status::invalid_args, "GetEmbListByStorageIds dataset is null");
+    }
     auto num_el_ids = dataset->GetRows();
-    auto el_ids = dataset->GetIds();
+    const auto* ids_to_retrieve = dataset->GetIds();
+    if (num_el_ids != 0 && ids_to_retrieve == nullptr) {
+        return expected<DataSetPtr>::Err(Status::invalid_args, "GetEmbListByStorageIds ids are null");
+    }
+    for (int64_t i = 0; i < num_el_ids; ++i) {
+        if (ids_to_retrieve[i] < 0 || static_cast<size_t>(ids_to_retrieve[i]) >= emb_list_offset_->num_el()) {
+            return expected<DataSetPtr>::Err(Status::invalid_args, "GetEmbListByStorageIds id is out of range");
+        }
+    }
     auto dim = use_raw_index ? emb_list_raw_index_->d : Dim();
 
-    // Build the output offset array
     std::vector<size_t> out_offsets(num_el_ids + 1);
     out_offsets[0] = 0;
     for (int64_t i = 0; i < num_el_ids; i++) {
-        auto el_id = el_ids[i];
-        if (el_id < 0 || static_cast<size_t>(el_id) >= emb_list_offset_->num_el()) {
-            return expected<DataSetPtr>::Err(Status::invalid_args,
-                                             "GetEmbListByIds: el_id " + std::to_string(el_id) + " out of range [0, " +
-                                                 std::to_string(emb_list_offset_->num_el()) + ")");
-        }
+        auto el_id = ids_to_retrieve[i];
         out_offsets[i + 1] = out_offsets[i] + emb_list_offset_->get_el_len(el_id);
     }
 
@@ -326,17 +402,18 @@ IndexNode::GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_t
         auto* offsets_ptr = new size_t[out_offsets.size()];
         std::memcpy(offsets_ptr, out_offsets.data(), out_offsets.size() * sizeof(size_t));
         result->Set(meta::EMB_LIST_OFFSET, static_cast<const size_t*>(offsets_ptr));
+        result->Set(meta::EMB_LIST_COUNT, num_el_ids);
         return result;
     }
 
     const void* tensor = nullptr;
 
     if (use_raw_index) {
-        // MUVERA/LEMUR: vectors are contiguous per el in emb_list_raw_index_, use reconstruct_n
+        // Strategy-owned raw storage is contiguous per compact list id.
         auto data = std::make_unique<float[]>(total_vecs * dim);
         float* ptr = data.get();
         for (int64_t i = 0; i < num_el_ids; i++) {
-            auto start = static_cast<int64_t>(emb_list_offset_->offset[el_ids[i]]);
+            auto start = static_cast<int64_t>(emb_list_offset_->offset[ids_to_retrieve[i]]);
             auto len = static_cast<int64_t>(out_offsets[i + 1] - out_offsets[i]);
             if (len > 0) {
                 emb_list_raw_index_->reconstruct_n(start, len, ptr);
@@ -345,28 +422,19 @@ IndexNode::GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_t
         }
         tensor = data.release();
     } else {
-        // TokenANN: collect vec_ids and use base index GetVectorByIds
-        //
-        // TODO(perf): Vectors within each embedding list are contiguous in the index. However, the current
-        // implementation collects all these contiguous IDs into a flat array and passes them to GetVectorByIds,
-        // which internally calls reconstruct(id, ...) one vector at a time. This could be optimized by using
-        // reconstruct_n(start, len, ...) or direct memcpy from raw data storage, avoiding both the redundant
-        // ID array allocation and per-vector overhead. We don't do this yet because it would require
-        // index-type-specific implementations (HNSW, IVF, FLAT, etc. each store raw data differently),
-        // whereas the current approach works generically across all index types via the GetVectorByIds interface.
+        // Base indexes retrieve by explicit base-vector storage ids.
         std::vector<int64_t> vec_ids;
         vec_ids.reserve(total_vecs);
         for (int64_t i = 0; i < num_el_ids; i++) {
-            size_t start = emb_list_offset_->offset[el_ids[i]];
+            size_t start = emb_list_offset_->offset[ids_to_retrieve[i]];
             size_t len = out_offsets[i + 1] - out_offsets[i];
             for (size_t j = 0; j < len; j++) {
                 vec_ids.push_back(static_cast<int64_t>(start + j));
             }
         }
 
-        // Build result: transfer tensor ownership from GetVectorByIds result to new dataset
         auto vec_dataset = GenIdsDataSet(vec_ids.size(), vec_ids.data());
-        auto res = GetVectorByIds(vec_dataset, op_context);
+        auto res = GetVectorByStorageIds(vec_dataset, op_context);
         if (!res.has_value()) {
             return res;
         }
@@ -380,6 +448,7 @@ IndexNode::GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_t
     auto* offsets_ptr = new size_t[out_offsets.size()];
     std::memcpy(offsets_ptr, out_offsets.data(), out_offsets.size() * sizeof(size_t));
     result->Set(meta::EMB_LIST_OFFSET, static_cast<const size_t*>(offsets_ptr));
+    result->Set(meta::EMB_LIST_COUNT, num_el_ids);
     return result;
 }
 
@@ -387,10 +456,9 @@ IndexNode::GetEmbListByIds(const DataSetPtr dataset, const std::string& metric_t
 
 Status
 IndexNode::BuildEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, const size_t* lims, size_t num_rows,
-                        bool use_knowhere_build_pool) {
+                        size_t num_el, bool use_knowhere_build_pool) {
     auto& config = static_cast<BaseConfig&>(*cfg);
 
-    // 1. Parse metric types
     auto metric_info_or = ParseEmbListMetric(config);
     if (!metric_info_or.has_value()) {
         return metric_info_or.error();
@@ -398,10 +466,8 @@ IndexNode::BuildEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, c
     el_metric_type_ = metric_info_or.value().el_metric_type;
     auto sub_metric_type = metric_info_or.value().sub_metric_type;
 
-    // 2. Create document offset structure
-    EmbListOffset doc_offset(lims, num_rows);
+    EmbListOffset doc_offset(lims, num_rows, num_el);
 
-    // 3. Create emb_list strategy
     auto strategy_type = config.emb_list_strategy.value_or(meta::EMB_LIST_STRATEGY_TOKENANN);
     auto strategy_or = CreateEmbListStrategy(strategy_type, config);
     if (!strategy_or.has_value()) {
@@ -410,24 +476,20 @@ IndexNode::BuildEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, c
     }
     emb_list_strategy_ = std::move(strategy_or.value());
 
-    // 4. Prepare data for build (strategy may transform data, e.g., FDE encoding in MUVERA)
     auto build_data_or = emb_list_strategy_->PrepareDataForBuild(dataset, doc_offset, config);
     if (!build_data_or.has_value()) {
         LOG_KNOWHERE_WARNING_ << "Failed to prepare data for build";
         return build_data_or.error();
     }
 
-    // Override metric_type to sub_metric for base index build
     config.metric_type = sub_metric_type;
 
-    // 5. Build underlying index (if strategy provides data)
     LOG_KNOWHERE_INFO_ << "Build EmbList-Index with strategy: " << strategy_type << ", metric type: " << el_metric_type_
                        << ", sub metric type: " << sub_metric_type;
     if (build_data_or.value().has_value()) {
         RETURN_IF_ERROR(Build(build_data_or.value().value(), cfg, use_knowhere_build_pool));
     }
 
-    // 6. Create raw vector storage if strategy needs it
     if (emb_list_strategy_->NeedsRawVectorStorage()) {
         auto original_dim = dataset->GetDim();
         auto total_vectors = dataset->GetRows();
@@ -444,15 +506,9 @@ IndexNode::BuildEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, c
         LOG_KNOWHERE_INFO_ << "Created raw vector storage: " << total_vectors << " vectors, dim=" << original_dim;
     }
 
-    // 7. Strategy post-build hook
     RETURN_IF_ERROR(emb_list_strategy_->OnBuildComplete(dataset, doc_offset, config));
 
-    // 8. Set ID mapping if strategy requires it (Direct needs vector->doc mapping)
     emb_list_offset_ = emb_list_strategy_->GetEmbListOffset();
-    if (emb_list_strategy_->NeedsBaseIndexIDMap()) {
-        return SetBaseIndexIDMap();
-    }
-
     return Status::success;
 }
 
@@ -474,15 +530,34 @@ IndexNode::ParseEmbListMetaHeader(const uint8_t* data, int64_t size) {
 }
 
 Status
-IndexNode::SerializeEmbList(BinarySet& binset) const {
-    LOG_KNOWHERE_INFO_ << "Serialize emb_list with strategy: " << emb_list_strategy_->Type();
+IndexNode::SerializeEmbListMeta(std::shared_ptr<uint8_t[]>& data, int64_t& size) const {
+    if (!emb_list_strategy_) {
+        return Status::emb_list_inner_error;
+    }
+
+    if (version_.VersionNumber() < kEmbListMetaV2MinVersion) {
+        if (emb_list_strategy_->Type() != meta::EMB_LIST_STRATEGY_TOKENANN) {
+            LOG_KNOWHERE_WARNING_ << "Legacy emb_list meta only supports TokenANN, got: " << emb_list_strategy_->Type()
+                                  << ", index version: " << version_.VersionNumber();
+            return Status::not_implemented;
+        }
+
+        auto emb_list_offset = emb_list_strategy_->GetEmbListOffset();
+        if (!emb_list_offset) {
+            return Status::emb_list_inner_error;
+        }
+
+        size = static_cast<int64_t>(EmbListOffsetByteSize(emb_list_offset));
+        data = std::shared_ptr<uint8_t[]>(new uint8_t[size]);
+        SerializeEmbListOffsetToBytes(emb_list_offset, data.get());
+        return Status::success;
+    }
+
     try {
-        // 1. Get strategy blob
         std::shared_ptr<uint8_t[]> strategy_data;
         int64_t strategy_size = 0;
         RETURN_IF_ERROR(emb_list_strategy_->Serialize(strategy_data, strategy_size));
 
-        // 2. Build EMB_LIST_META = [magic][type_len][type][strategy_blob]
         auto strategy_type = emb_list_strategy_->Type();
         size_t type_len = strategy_type.size();
 
@@ -493,10 +568,25 @@ IndexNode::SerializeEmbList(BinarySet& binset) const {
         writer(strategy_type.data(), type_len, 1);
         writer(strategy_data.get(), strategy_size, 1);
 
-        std::shared_ptr<uint8_t[]> meta_data(writer.data());
-        binset.Append(meta::EMB_LIST_META, meta_data, writer.tellg());
+        data = std::shared_ptr<uint8_t[]>(writer.data());
+        size = writer.tellg();
+        return Status::success;
+    } catch (const std::exception& e) {
+        LOG_KNOWHERE_WARNING_ << "serialize emb_list meta error: " << e.what();
+        return Status::emb_list_inner_error;
+    }
+}
 
-        // 3. Raw vector index as separate key (large, needs mmap in file path)
+Status
+IndexNode::SerializeEmbList(BinarySet& binset) const {
+    LOG_KNOWHERE_INFO_ << "Serialize emb_list with strategy: " << emb_list_strategy_->Type()
+                       << ", index version: " << version_.VersionNumber();
+    try {
+        std::shared_ptr<uint8_t[]> meta_data;
+        int64_t meta_size = 0;
+        RETURN_IF_ERROR(SerializeEmbListMeta(meta_data, meta_size));
+        binset.Append(meta::EMB_LIST_META, meta_data, meta_size);
+
         if (emb_list_raw_index_) {
             MemoryIOWriter writer;
             faiss::cppcontrib::knowhere::write_index(emb_list_raw_index_.get(), &writer);
@@ -508,7 +598,6 @@ IndexNode::SerializeEmbList(BinarySet& binset) const {
         return Status::emb_list_inner_error;
     }
 
-    // 4. Serialize base index
     return Serialize(binset);
 }
 
@@ -516,19 +605,16 @@ Status
 IndexNode::DeserializeEmbListFromBinarySet(const BinarySet& binset, std::shared_ptr<Config> config) {
     auto& cfg = static_cast<knowhere::BaseConfig&>(*config);
 
-    // 1. Parse metric type
     auto metric_info_or = ParseEmbListMetric(cfg);
     if (!metric_info_or.has_value()) {
         return metric_info_or.error();
     }
     el_metric_type_ = metric_info_or.value().el_metric_type;
 
-    // 2. Deserialize base index from BinarySet (override metric_type for base index)
     cfg.metric_type = metric_info_or.value().sub_metric_type;
     RETURN_IF_ERROR(Deserialize(binset, config));
 
     try {
-        // 3. Read EMB_LIST_META and parse strategy type + strategy blob
         auto meta_bin = binset.GetByName(meta::EMB_LIST_META);
         if (!meta_bin) {
             LOG_KNOWHERE_WARNING_ << "EMB_LIST_META not found in binary set";
@@ -538,7 +624,6 @@ IndexNode::DeserializeEmbListFromBinarySet(const BinarySet& binset, std::shared_
         auto [strategy_type, strategy_blob, strategy_blob_size] =
             ParseEmbListMetaHeader(meta_bin->data.get(), meta_bin->size);
 
-        // 4. Create strategy and deserialize strategy-specific data
         auto strategy_or = CreateEmbListStrategy(strategy_type, cfg);
         if (!strategy_or.has_value()) {
             LOG_KNOWHERE_WARNING_ << "Failed to create emb_list strategy: " << strategy_type;
@@ -549,7 +634,6 @@ IndexNode::DeserializeEmbListFromBinarySet(const BinarySet& binset, std::shared_
         LOG_KNOWHERE_INFO_ << "Deserialize emb_list with strategy: " << strategy_type;
         RETURN_IF_ERROR(emb_list_strategy_->Deserialize(strategy_blob, strategy_blob_size, cfg));
 
-        // 5. Deserialize raw vector index from BinarySet (if present)
         auto raw_index_bin = binset.GetByName(meta::EMB_LIST_RAW_INDEX);
         if (raw_index_bin) {
             MemoryIOReader reader(raw_index_bin->data.get(), raw_index_bin->size);
@@ -567,11 +651,8 @@ IndexNode::DeserializeEmbListFromBinarySet(const BinarySet& binset, std::shared_
             return Status::emb_list_inner_error;
         }
 
-        // 6. Set ID mapping if needed
         emb_list_offset_ = emb_list_strategy_->GetEmbListOffset();
-        if (emb_list_strategy_->NeedsBaseIndexIDMap()) {
-            return SetBaseIndexIDMap();
-        }
+        return Status::success;
     } catch (const std::exception& e) {
         LOG_KNOWHERE_WARNING_ << "deserialize emb_list error: " << e.what();
         return Status::emb_list_inner_error;
@@ -584,25 +665,21 @@ Status
 IndexNode::DeserializeEmbListFromFile(const std::string& filename, std::shared_ptr<Config> config) {
     auto& cfg = static_cast<knowhere::BaseConfig&>(*config);
 
-    // 1. Parse metric type
     auto metric_info_or = ParseEmbListMetric(cfg);
     if (!metric_info_or.has_value()) {
         return metric_info_or.error();
     }
     el_metric_type_ = metric_info_or.value().el_metric_type;
 
-    // 2. Deserialize base index from file (override metric_type for base index)
     cfg.metric_type = metric_info_or.value().sub_metric_type;
     RETURN_IF_ERROR(DeserializeFromFile(filename, config));
 
-    // 3. Read meta file and parse strategy type + strategy blob
     if (!cfg.emb_list_meta_file_path.has_value() || cfg.emb_list_meta_file_path.value().empty()) {
         LOG_KNOWHERE_WARNING_ << "emb_list_meta_file is empty, but metric type is emb_list";
         return Status::emb_list_inner_error;
     }
     auto emb_list_meta_file_path = cfg.emb_list_meta_file_path.value();
 
-    // Read entire meta file into memory
     std::shared_ptr<uint8_t[]> file_data;
     int64_t file_size = 0;
     {
@@ -629,7 +706,6 @@ IndexNode::DeserializeEmbListFromFile(const std::string& filename, std::shared_p
     auto [strategy_type, strategy_blob, strategy_blob_size] = ParseEmbListMetaHeader(file_data.get(), file_size);
 
     try {
-        // 4. Create strategy and deserialize strategy-specific data
         auto strategy_or = CreateEmbListStrategy(strategy_type, cfg);
         if (!strategy_or.has_value()) {
             LOG_KNOWHERE_WARNING_ << "Failed to create emb_list strategy: " << strategy_type;
@@ -640,7 +716,6 @@ IndexNode::DeserializeEmbListFromFile(const std::string& filename, std::shared_p
         LOG_KNOWHERE_INFO_ << "Deserialize emb_list from file with strategy: " << strategy_type;
         RETURN_IF_ERROR(emb_list_strategy_->Deserialize(strategy_blob, strategy_blob_size, cfg));
 
-        // 5. Load raw vector index from separate file (if strategy needs it)
         if (emb_list_strategy_->NeedsRawVectorStorage()) {
             if (!cfg.emb_list_raw_index_file_path.has_value() || cfg.emb_list_raw_index_file_path.value().empty()) {
                 LOG_KNOWHERE_WARNING_ << "Strategy requires raw vector storage but "
@@ -666,11 +741,8 @@ IndexNode::DeserializeEmbListFromFile(const std::string& filename, std::shared_p
                                << " vectors, mmap=" << cfg.enable_mmap.value();
         }
 
-        // 6. Set ID mapping if needed
         emb_list_offset_ = emb_list_strategy_->GetEmbListOffset();
-        if (emb_list_strategy_->NeedsBaseIndexIDMap()) {
-            return SetBaseIndexIDMap();
-        }
+        return Status::success;
     } catch (const std::exception& e) {
         LOG_KNOWHERE_WARNING_ << "deserialize emb_list from file error: " << e.what();
         return Status::emb_list_inner_error;
@@ -714,6 +786,9 @@ IndexNode::CalcDistByRawIndex(const DataSetPtr dataset, const int64_t* labels, s
             }));
         }
         WaitAllSuccess(futs);
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<DataSetPtr>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         LOG_KNOWHERE_WARNING_ << "CalcDistByRawIndex error: " << e.what();
         return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());

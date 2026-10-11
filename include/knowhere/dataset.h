@@ -13,23 +13,95 @@
 #define DATASET_H
 
 #include <any>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 #include <variant>
 
 #include "comp/index_param.h"
+#include "knowhere/comp/search_hint.h"
 #include "knowhere/range_util.h"
 #include "knowhere/sparse_utils.h"
 
 namespace knowhere {
 
+// Non-owning input view for nullable id-map build/add data.
+class IdMapData {
+ public:
+    // PACKED_BITMAP and BOOL_ARRAY carry public-id validity. IDS carries an
+    // already compact internal-id -> public-id array plus its public-id domain
+    // size.
+    enum class Format {
+        NONE,
+        PACKED_BITMAP,
+        BOOL_ARRAY,
+        IDS,
+    };
+
+    static IdMapData
+    FromValidBitmap(const uint8_t* valid_bitmap, size_t out_count) {
+        return {Format::PACKED_BITMAP, valid_bitmap, nullptr, nullptr, 0, out_count};
+    }
+
+    static IdMapData
+    FromValidData(const bool* valid_data, size_t out_count) {
+        return {Format::BOOL_ARRAY, nullptr, valid_data, nullptr, 0, out_count};
+    }
+
+    static IdMapData
+    FromIds(const int32_t* out_ids, size_t in_count, size_t out_count) {
+        return {Format::IDS, nullptr, nullptr, out_ids, in_count, out_count};
+    }
+
+    bool
+    HasValue() const {
+        return format != Format::NONE;
+    }
+
+    static constexpr const char* DATASET_KEY = "__knowhere_id_map_data";
+
+    Format format = Format::NONE;
+    const uint8_t* valid_bitmap = nullptr;
+    const bool* valid_data = nullptr;
+    const int32_t* out_ids = nullptr;
+    size_t in_count = 0;
+    size_t out_count = 0;
+};
+
 class DataSet : public std::enable_shared_from_this<const DataSet> {
  public:
     using Var = std::variant<const float*, const size_t*, const int64_t*, const void*, int64_t, std::string, std::any>;
     DataSet() = default;
+    void
+    SetSearchHints(BatchSearchHints hints) {
+        auto owned = std::make_shared<const BatchSearchHints>(std::move(hints));
+        std::unique_lock lock(mutex_);
+        data_[kSearchHintsField] = Var(std::in_place_type<std::any>, std::move(owned));
+    }
+
+    std::shared_ptr<const BatchSearchHints>
+    GetSearchHints() const {
+        std::shared_lock lock(mutex_);
+        auto it = data_.find(kSearchHintsField);
+        if (it == data_.end())
+            return nullptr;
+        auto holder = std::get_if<std::any>(&it->second);
+        auto hints = std::any_cast<std::shared_ptr<const BatchSearchHints>>(holder);
+        if (hints == nullptr)
+            throw std::invalid_argument("invalid typed search hints");
+        return *hints;
+    }
+
+    void
+    ClearSearchHints() {
+        std::unique_lock lock(mutex_);
+        data_.erase(kSearchHintsField);
+    }
     ~DataSet() {
         if (!is_owner) {
             return;
@@ -184,6 +256,53 @@ class DataSet : public std::enable_shared_from_this<const DataSet> {
     SetJsonIdSet(const std::string& idset) {
         std::unique_lock lock(mutex_);
         this->data_[meta::JSON_ID_SET] = Var(std::in_place_index<5>, idset);
+    }
+
+    void
+    SetIdMapData(const IdMapData& id_map_data) {
+        // The pointed-to buffers must outlive the Build/Add call.
+        std::unique_lock lock(mutex_);
+        this->data_[IdMapData::DATASET_KEY] = Var(std::in_place_type<std::any>, id_map_data);
+    }
+
+    IdMapData
+    GetIdMapData() const {
+        std::shared_lock lock(mutex_);
+        auto it = this->data_.find(IdMapData::DATASET_KEY);
+        if (it == this->data_.end()) {
+            return {};
+        }
+
+        auto any_ptr = std::get_if<std::any>(&it->second);
+        if (any_ptr == nullptr) {
+            return {};
+        }
+
+        auto id_map_data = std::any_cast<IdMapData>(any_ptr);
+        return id_map_data == nullptr ? IdMapData{} : *id_map_data;
+    }
+
+    bool
+    HasIdMapData() const {
+        std::shared_lock lock(mutex_);
+        auto it = this->data_.find(IdMapData::DATASET_KEY);
+        if (it == this->data_.end()) {
+            return false;
+        }
+
+        auto any_ptr = std::get_if<std::any>(&it->second);
+        if (any_ptr == nullptr) {
+            return false;
+        }
+
+        auto id_map_data = std::any_cast<IdMapData>(any_ptr);
+        return id_map_data != nullptr && id_map_data->HasValue();
+    }
+
+    void
+    ClearIdMapData() {
+        std::unique_lock lock(mutex_);
+        this->data_.erase(IdMapData::DATASET_KEY);
     }
 
     const float*

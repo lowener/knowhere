@@ -105,6 +105,10 @@ static std::set<std::pair<std::string, VecType>> legal_knowhere_index = {
     {IndexEnum::INDEX_HNSW_PRQ, VecType::VECTOR_BFLOAT16},
     {IndexEnum::INDEX_HNSW_PRQ, VecType::VECTOR_INT8},
 
+    {IndexEnum::INDEX_HNSW_RABITQ, VecType::VECTOR_FLOAT},
+    {IndexEnum::INDEX_HNSW_RABITQ, VecType::VECTOR_FLOAT16},
+    {IndexEnum::INDEX_HNSW_RABITQ, VecType::VECTOR_BFLOAT16},
+
     // diskann
     {IndexEnum::INDEX_DISKANN, VecType::VECTOR_FLOAT},
     {IndexEnum::INDEX_DISKANN, VecType::VECTOR_FLOAT16},
@@ -129,6 +133,12 @@ static std::set<std::pair<std::string, VecType>> legal_knowhere_index = {
     {IndexEnum::INDEX_SVS_VAMANA_LEANVEC, VecType::VECTOR_FLOAT},
     {IndexEnum::INDEX_SVS_VAMANA_LEANVEC, VecType::VECTOR_FLOAT16},
     {IndexEnum::INDEX_SVS_VAMANA_LEANVEC, VecType::VECTOR_BFLOAT16},
+    {IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_FLOAT},
+    {IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_FLOAT16},
+    {IndexEnum::INDEX_SVS_IVF, VecType::VECTOR_BFLOAT16},
+    {IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_FLOAT},
+    {IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_FLOAT16},
+    {IndexEnum::INDEX_SVS_IVF_LEANVEC, VecType::VECTOR_BFLOAT16},
 #endif
 
     // sparse index

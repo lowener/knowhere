@@ -145,8 +145,8 @@ void IndexIVFAdditiveQuantizer::reconstruct_from_offset(
         int64_t list_no,
         int64_t offset,
         float* recons) const {
-    const uint8_t* code = invlists->get_single_code(list_no, offset);
-    aq->decode(code, recons, 1);
+    InvertedLists::ScopedCodes sc(invlists, list_no, offset);
+    aq->decode(sc.get(), recons, 1);
     if (by_residual) {
         std::vector<float> centroid(d);
         quantizer->reconstruct(list_no, centroid.data());
@@ -283,7 +283,7 @@ InvertedListScanner* IndexIVFAdditiveQuantizer::get_InvertedListScanner(
         bool store_pairs,
         const IDSelector* sel,
         const IVFSearchParameters*) const {
-    FAISS_THROW_IF_NOT(!sel);
+    FAISS_THROW_IF_MSG(sel, "id selector not supported for this index");
     if (metric_type == METRIC_INNER_PRODUCT) {
         if (aq->search_type == AdditiveQuantizer::ST_decompress) {
             return new AQInvertedListScannerDecompress<true>(

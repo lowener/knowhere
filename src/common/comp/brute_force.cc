@@ -24,6 +24,7 @@
 #include "knowhere/bitsetview_idselector.h"
 #include "knowhere/comp/task.h"
 #include "knowhere/config.h"
+#include "knowhere/context.h"
 #include "knowhere/emb_list_utils.h"
 #include "knowhere/expected.h"
 #include "knowhere/heap.h"
@@ -35,6 +36,7 @@
 #include "simd/hook.h"
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
+#include "common/Tracer.h"
 #include "knowhere/tracer.h"
 #endif
 
@@ -140,12 +142,124 @@ GetInverseVecNorms(const DataSetPtr& base) {
         return inv_norms;
     }
 }
+
+void
+PrepareBitsetForInternalRange(BitsetView& bitset, size_t num_internal_ids, size_t internal_id_offset) {
+    if (bitset.has_out_ids()) {
+        return;
+    }
+    if (bitset.empty() || bitset.data() == nullptr) {
+        return;
+    }
+
+    // Local chunk ids use a contiguous public-id offset when no map is present.
+    bitset.set_id_offset(internal_id_offset);
+    bitset.count_filtered_bits(internal_id_offset, num_internal_ids);
+}
+
+Status
+UseOutIdsWindow(BitsetView& bitset, size_t internal_id_offset, size_t num_internal_ids) {
+    if (!bitset.has_out_ids()) {
+        return Status::success;
+    }
+    const auto total_out_ids = bitset.out_ids_count();
+    if (internal_id_offset > total_out_ids || num_internal_ids > total_out_ids - internal_id_offset) {
+        LOG_KNOWHERE_WARNING_ << "brute-force out id map is smaller than the internal id range";
+        return Status::invalid_args;
+    }
+    // Filtering and result mapping use the same local physical-id window.
+    bitset.set_id_offset(internal_id_offset);
+    bitset.set_vector_count(num_internal_ids);
+    return Status::success;
+}
+
+Status
+MapOneResultId(int64_t& id, const BitsetView& bitset, int64_t id_offset) {
+    if (id < 0) {
+        return Status::success;
+    }
+    if (bitset.has_out_ids()) {
+        const auto internal_id = static_cast<size_t>(id);
+        const auto& out_ids = bitset.get_out_ids();
+        id = out_ids[bitset.id_offset() + internal_id];
+        return Status::success;
+    }
+    id += id_offset;
+    return Status::success;
+}
+
+template <typename IdType>
+Status
+MapResultIds(IdType* ids, size_t count, const BitsetView& bitset, int64_t id_offset) {
+    for (size_t i = 0; i < count; ++i) {
+        int64_t id = static_cast<int64_t>(ids[i]);
+        RETURN_IF_ERROR(MapOneResultId(id, bitset, id_offset));
+        ids[i] = static_cast<IdType>(id);
+    }
+    return Status::success;
+}
+
+Status
+MapResultIdArray(std::vector<std::vector<int64_t>>& result_id_array, const BitsetView& bitset, int64_t id_offset) {
+    for (auto& ids : result_id_array) {
+        RETURN_IF_ERROR(MapResultIds(ids.data(), ids.size(), bitset, id_offset));
+    }
+    return Status::success;
+}
+
+void
+MapOneResultIdOrThrow(int64_t& id, const BitsetView& bitset, int64_t id_offset) {
+    auto status = MapOneResultId(id, bitset, id_offset);
+    if (status != Status::success) {
+        KNOWHERE_THROW_MSG("failed to map brute-force result id");
+    }
+}
+
+void
+MapDistIdsOrThrow(std::vector<DistId>& distances_ids, const BitsetView& bitset, int64_t id_offset) {
+    for (auto& distances_id : distances_ids) {
+        MapOneResultIdOrThrow(distances_id.id, bitset, id_offset);
+    }
+}
+
+void
+CopyMappedChunkDistIds(std::vector<DistId>& dst, size_t dst_begin, const std::vector<DistId>& src,
+                       const BitsetView& bitset, int64_t id_offset) {
+    for (size_t i = 0; i < src.size(); ++i) {
+        auto id = src[i].id;
+        MapOneResultIdOrThrow(id, bitset, id_offset);
+        dst[dst_begin + i] = {id, src[i].val};
+    }
+}
+
+struct PreparedBitsetState {
+    // Owns bitset windows used by lazy brute-force iterators.
+    BitsetView bitset;
+    std::vector<BitsetView> chunk_bitsets;
+};
 }  // namespace
 
 template <typename DataType>
+Status
+BruteForceSearchWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
+                            const Json& config, const BitsetView& bitset, milvus::OpContext* op_context);
+
+template <typename DataType>
+Status
+BruteForceSearchOnChunkWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
+                                   float* dis, const Json& config, const BitsetView& bitset,
+                                   milvus::OpContext* op_context);
+
+template <typename DataType>
+expected<std::vector<IndexNode::IteratorPtr>>
+BruteForceAnnIteratorOnChunkImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                                 const BitsetView& bitset, bool use_knowhere_search_pool,
+                                 milvus::OpContext* op_context);
+
+template <typename DataType>
 expected<DataSetPtr>
-BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                   const BitsetView& bitset_, milvus::OpContext* op_context) {
+BruteForceSearchImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                     const BitsetView& bitset_, milvus::OpContext* op_context) {
     BruteForceConfig cfg;
     std::string msg;
     auto status = Config::Load(cfg, config, knowhere::SEARCH, &msg);
@@ -163,8 +277,7 @@ BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset
         }
     }
     // if emb_list, nq = num of emb_list; if not, nq = num of query vectors
-    auto nq = metric_is_emb_list ? EmbListOffset(query_emb_list_offset, query_dataset->GetRows()).num_el()
-                                 : query_dataset->GetRows();
+    auto nq = metric_is_emb_list ? GetEmbListCount(query_dataset) : static_cast<size_t>(query_dataset->GetRows());
     int topk = cfg.k.value();
     auto labels = std::make_unique<int64_t[]>(nq * topk);
     auto distances = std::make_unique<float[]>(nq * topk);
@@ -172,11 +285,11 @@ BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset
     Status search_status;
     bool base_is_chunk = base_dataset->GetIsChunk();
     if (base_is_chunk) {
-        search_status = SearchOnChunkWithBuf<DataType>(base_dataset, query_dataset, labels.get(), distances.get(),
-                                                       config, bitset_, op_context);
+        search_status = BruteForceSearchOnChunkWithBufImpl<DataType>(base_dataset, query_dataset, labels.get(),
+                                                                     distances.get(), config, bitset_, op_context);
     } else {
-        search_status = SearchWithBuf<DataType>(base_dataset, query_dataset, labels.get(), distances.get(), config,
-                                                bitset_, op_context);
+        search_status = BruteForceSearchWithBufImpl<DataType>(base_dataset, query_dataset, labels.get(),
+                                                              distances.get(), config, bitset_, op_context);
     }
     if (search_status != Status::success) {
         return expected<DataSetPtr>::Err(search_status, "search failed");
@@ -308,10 +421,11 @@ brute_force_minhash_impl(const void* xq, const void* xb, int64_t* labels, float*
 
 template <typename DataType>
 Status
-brute_force_emb_list_impl(const void* xq, size_t query_el_idx, const void* xb, int64_t* ids, float* dis, size_t topk,
-                          size_t dim, const EmbListOffset& base_el_offset, const EmbListOffset& query_el_offset,
-                          const std::string& el_metric_type, const std::string& el_sub_metric_type,
-                          const BitsetView& bitset, const BaseConfig& cfg, size_t xb_id_offset) {
+brute_force_emb_list_impl(const void* xq, size_t query_el_idx, size_t result_el_idx, const void* xb, int64_t* ids,
+                          float* dis, size_t topk, size_t dim, const EmbListOffset& base_el_offset,
+                          const EmbListOffset& query_el_offset, const std::string& el_metric_type,
+                          const std::string& el_sub_metric_type, const BitsetView& bitset, const BaseConfig& cfg,
+                          size_t xb_id_offset) {
     auto num_base_el = base_el_offset.num_el();
 
     auto el_agg_func_or = get_emb_list_agg_func(el_metric_type);
@@ -416,51 +530,54 @@ brute_force_emb_list_impl(const void* xq, size_t query_el_idx, const void* xb, i
                 return Status::brute_force_inner_error;
             }
             auto score = score_or.value();
+            auto out_id = static_cast<int64_t>(base_el_idx);
+            RETURN_IF_ERROR(MapOneResultId(out_id, bitset, xb_id_offset));
             if (larger_is_closer) {
                 if (minheap.size() < topk) {
-                    minheap.emplace(static_cast<int64_t>(base_el_idx) + xb_id_offset, score);
+                    minheap.emplace(out_id, score);
                 } else {
                     if (score > minheap.top().val) {
                         minheap.pop();
-                        minheap.emplace(static_cast<int64_t>(base_el_idx) + xb_id_offset, score);
+                        minheap.emplace(out_id, score);
                     }
                 }
             } else {
                 if (maxheap.size() < topk) {
-                    maxheap.emplace(static_cast<int64_t>(base_el_idx) + xb_id_offset, score);
+                    maxheap.emplace(out_id, score);
                 } else {
                     if (score < maxheap.top().val) {
                         maxheap.pop();
-                        maxheap.emplace(static_cast<int64_t>(base_el_idx) + xb_id_offset, score);
+                        maxheap.emplace(out_id, score);
                     }
                 }
             }
         }
     }
     size_t real_el_k = 0;
+    const auto result_offset = result_el_idx * topk;
     if (larger_is_closer) {
         real_el_k = minheap.size();
         for (size_t j = 0; j < real_el_k; j++) {
             auto& a = minheap.top();
-            ids[query_el_idx * topk + real_el_k - j - 1] = a.id;
-            dis[query_el_idx * topk + real_el_k - j - 1] = a.val;
+            ids[result_offset + real_el_k - j - 1] = a.id;
+            dis[result_offset + real_el_k - j - 1] = a.val;
             minheap.pop();
         }
         for (size_t j = real_el_k; j < topk; j++) {
-            ids[query_el_idx * topk + j] = -1;
-            dis[query_el_idx * topk + j] = std::numeric_limits<float>::min();
+            ids[result_offset + j] = -1;
+            dis[result_offset + j] = std::numeric_limits<float>::min();
         }
     } else {
         real_el_k = maxheap.size();
         for (size_t j = 0; j < real_el_k; j++) {
             auto& a = maxheap.top();
-            ids[query_el_idx * topk + real_el_k - j - 1] = a.id;
-            dis[query_el_idx * topk + real_el_k - j - 1] = a.val;
+            ids[result_offset + real_el_k - j - 1] = a.id;
+            dis[result_offset + real_el_k - j - 1] = a.val;
             maxheap.pop();
         }
         for (size_t j = real_el_k; j < topk; j++) {
-            ids[query_el_idx * topk + j] = -1;
-            dis[query_el_idx * topk + j] = std::numeric_limits<float>::max();
+            ids[result_offset + j] = -1;
+            dis[result_offset + j] = std::numeric_limits<float>::max();
         }
     }
     return Status::success;
@@ -468,11 +585,12 @@ brute_force_emb_list_impl(const void* xq, size_t query_el_idx, const void* xb, i
 
 template <typename DataType>
 Status
-BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
-                          const Json& config, const BitsetView& bitset_, milvus::OpContext* op_context) {
+BruteForceSearchWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
+                            const Json& config, const BitsetView& bitset_, milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (base_is_chunk) {
-        return SearchOnChunkWithBuf<DataType>(base_dataset, query_dataset, ids, dis, config, bitset_, op_context);
+        return BruteForceSearchOnChunkWithBufImpl<DataType>(base_dataset, query_dataset, ids, dis, config, bitset_,
+                                                            op_context);
     }
     auto xb = base_dataset->GetTensor();
     auto nb = base_dataset->GetRows();
@@ -480,7 +598,6 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
     bool base_data_is_emb_list = base_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET) != nullptr;
     auto xb_id_offset = base_dataset->GetTensorBeginId();
     BitsetView bitset = bitset_;
-    bitset.set_id_offset(xb_id_offset);
 
     auto xq = query_dataset->GetTensor();
     auto nq = query_dataset->GetRows();
@@ -491,19 +608,14 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf search with buf", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::TOPK, cfg.k.value());
-        span->SetAttribute(meta::ROWS, nb);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf search with buf", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::TOPK, cfg.k.value());
+        span_ptr->SetAttribute(meta::ROWS, nb);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -527,8 +639,11 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
         }
         auto el_sub_metric_type = el_sub_metric_type_or.value();
 
-        auto base_el_offset = EmbListOffset(base_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET), nb);
-        auto query_el_offset = EmbListOffset(query_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET), nq);
+        auto base_el_offset = EmbListOffset(base_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET), nb,
+                                            GetEmbListCount(base_dataset));
+        auto query_el_offset = EmbListOffset(query_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET), nq,
+                                             GetEmbListCount(query_dataset));
+        PrepareBitsetForInternalRange(bitset, base_el_offset.num_el(), static_cast<size_t>(xb_id_offset));
         auto num_query_el = query_el_offset.num_el();
 
         auto pool = ThreadPool::GetGlobalSearchThreadPool();
@@ -541,29 +656,28 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
                 continue;
             }
             futs.emplace_back(pool->push([&, query_el_idx = query_el_i] {
+                knowhere::checkCancellation(op_context);
                 ThreadPool::ScopedSearchOmpSetter setter(1);
-                RETURN_IF_ERROR(brute_force_emb_list_impl<DataType>(xq, query_el_idx, xb, ids, dis, topk, dim,
-                                                                    base_el_offset, query_el_offset, el_metric_type,
-                                                                    el_sub_metric_type, bitset, cfg, xb_id_offset));
+                RETURN_IF_ERROR(brute_force_emb_list_impl<DataType>(
+                    xq, query_el_idx, query_el_idx, xb, ids, dis, topk, dim, base_el_offset, query_el_offset,
+                    el_metric_type, el_sub_metric_type, bitset, cfg, xb_id_offset));
                 return Status::success;
             }));
         }
 
         RETURN_IF_ERROR(WaitAllSuccess(futs));
     } else if (IsMetricType(metric_str, metric::MHJACCARD)) {
+        PrepareBitsetForInternalRange(bitset, nb, static_cast<size_t>(xb_id_offset));
         auto labels = ids;
         auto distances = dis;
         RETURN_IF_ERROR(brute_force_minhash_impl<DataType>(xq, xb, labels, distances, dim, nb, nq, topk, bitset, cfg));
-        if (xb_id_offset != 0) {
-            for (auto i = 0; i < nq * topk; i++) {
-                labels[i] = labels[i] == -1 ? -1 : labels[i] + xb_id_offset;
-            }
-        }
+        RETURN_IF_ERROR(MapResultIds(labels, nq * topk, bitset, xb_id_offset));
     } else {
         if (query_is_emb_list) {
             LOG_KNOWHERE_ERROR_ << "query dataset is emb_list, but metric is not for emb_list";
             return Status::invalid_metric_type;
         }
+        PrepareBitsetForInternalRange(bitset, nb, static_cast<size_t>(xb_id_offset));
         auto result = Str2FaissMetricType(cfg.metric_type.value());
         if (result.error() != Status::success) {
             return result.error();
@@ -580,6 +694,7 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
         futs.reserve(nq);
         for (int i = 0; i < nq; ++i) {
             futs.emplace_back(pool->push([&, index = i] {
+                knowhere::checkCancellation(op_context);
                 ThreadPool::ScopedSearchOmpSetter setter(1);
                 auto cur_labels = labels + topk * index;
                 auto cur_distances = distances + topk * index;
@@ -592,29 +707,17 @@ BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_
         }
         RETURN_IF_ERROR(WaitAllSuccess(futs));
 
-        if (xb_id_offset != 0) {
-            for (auto i = 0; i < nq * topk; i++) {
-                labels[i] = labels[i] == -1 ? -1 : labels[i] + xb_id_offset;
-            }
-        }
+        RETURN_IF_ERROR(MapResultIds(labels, nq * topk, bitset, xb_id_offset));
     }
-
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
 
     return Status::success;
 }
 
 template <typename DataType>
 Status
-BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
-                                 float* dis, const Json& config, const BitsetView& bitset_,
-                                 milvus::OpContext* op_context) {
+BruteForceSearchOnChunkWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
+                                   float* dis, const Json& config, const BitsetView& bitset_,
+                                   milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (!base_is_chunk) {
         LOG_KNOWHERE_ERROR_ << "Base dataset is not chunk, should NOT use it.";
@@ -630,7 +733,6 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
 
     auto xb_id_offset = base_dataset->GetTensorBeginId();
     BitsetView bitset = bitset_;
-    bitset.set_id_offset(xb_id_offset);
 
     BruteForceConfig cfg;
     RETURN_IF_ERROR(Config::Load(cfg, config, knowhere::SEARCH));
@@ -655,19 +757,15 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf search [on chunk] with buf", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::TOPK, cfg.k.value());
-        span->SetAttribute(meta::ROWS, num_total_vectors);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf search [on chunk] with buf",
+                                                                       op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::TOPK, cfg.k.value());
+        span_ptr->SetAttribute(meta::ROWS, num_total_vectors);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -691,11 +789,21 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
             larger_is_closer = false;
         }
 
+        std::vector<BitsetView> chunk_bitsets(num_chunk);
+        for (int chunk_idx = 0; chunk_idx < num_chunk; ++chunk_idx) {
+            auto num_base_vectors = chunk_lims[chunk_idx + 1] - chunk_lims[chunk_idx];
+            chunk_bitsets[chunk_idx] = bitset;
+            RETURN_IF_ERROR(UseOutIdsWindow(chunk_bitsets[chunk_idx], chunk_lims[chunk_idx], num_base_vectors));
+            PrepareBitsetForInternalRange(chunk_bitsets[chunk_idx], num_base_vectors,
+                                          xb_id_offset + chunk_lims[chunk_idx]);
+        }
+
         auto pool = ThreadPool::GetGlobalSearchThreadPool();
         std::vector<folly::Future<Status>> futs;
         futs.reserve(nq);
         for (int i = 0; i < nq; ++i) {
             futs.emplace_back(pool->push([&, query_idx = i] {
+                knowhere::checkCancellation(op_context);
                 ThreadPool::ScopedSearchOmpSetter setter(1);
                 std::vector<int64_t> tmp_labels(k);
                 std::vector<float> tmp_distances(k);
@@ -710,9 +818,7 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
                     std::fill(tmp_distances.begin(), tmp_distances.end(),
                               larger_is_closer ? std::numeric_limits<float>::min() : std::numeric_limits<float>::max());
 
-                    // adjust bitset offset for this chunk so selector indices map to global ids
-                    BitsetView chunk_bitset = bitset;
-                    chunk_bitset.set_id_offset(xb_id_offset + chunk_lims[chunk_idx]);
+                    const auto& chunk_bitset = chunk_bitsets[chunk_idx];
                     auto chunk_inv_norms = inv_norms == nullptr ? nullptr : inv_norms.get() + chunk_lims[chunk_idx];
 
                     RETURN_IF_ERROR(brute_force_dense_impl<DataType>(
@@ -725,7 +831,9 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
                         if (id < 0) {
                             continue;
                         }
-                        auto global_id = static_cast<int64_t>(id) + static_cast<int64_t>(chunk_lims[chunk_idx]);
+                        auto global_id = id;
+                        RETURN_IF_ERROR(MapOneResultId(global_id, chunk_bitset,
+                                                       xb_id_offset + static_cast<int64_t>(chunk_lims[chunk_idx])));
                         auto distance = tmp_distances[j];
                         if (larger_is_closer) {
                             if (minheap.size() < static_cast<size_t>(k)) {
@@ -779,12 +887,6 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
         }
         RETURN_IF_ERROR(WaitAllSuccess(futs));
 
-        if (xb_id_offset != 0) {
-            for (auto i = 0; i < nq * k; i++) {
-                ids[i] = ids[i] == -1 ? -1 : ids[i] + xb_id_offset;
-            }
-        }
-
     } else {
         if (!base_is_emb_list || !query_is_emb_list) {
             LOG_KNOWHERE_ERROR_ << "both base dataset and query dataset must be emb_list if metric is for emb_list";
@@ -805,12 +907,19 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
             larger_is_closer = false;
         }
 
-        auto query_el_offset = EmbListOffset(query_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET), nq);
+        auto query_el_offset = EmbListOffset(query_dataset->Get<const size_t*>(knowhere::meta::EMB_LIST_OFFSET), nq,
+                                             GetEmbListCount(query_dataset));
         auto num_query_el = query_el_offset.num_el();
 
         auto pool = ThreadPool::GetGlobalSearchThreadPool();
         std::vector<folly::Future<Status>> futs;
         futs.reserve(num_query_el);
+        std::vector<BitsetView> chunk_bitsets(num_chunk);
+        for (int chunk_idx = 0; chunk_idx < num_chunk; ++chunk_idx) {
+            chunk_bitsets[chunk_idx] = bitset;
+            RETURN_IF_ERROR(UseOutIdsWindow(chunk_bitsets[chunk_idx], chunk_idx, 1));
+            PrepareBitsetForInternalRange(chunk_bitsets[chunk_idx], 1, xb_id_offset + chunk_idx);
+        }
         for (auto query_el_i = 0; std::cmp_less(query_el_i, num_query_el); query_el_i++) {
             auto num_query_vectors = query_el_offset.get_el_len(query_el_i);
             if (num_query_vectors == 0) {
@@ -818,6 +927,7 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
             }
 
             futs.emplace_back(pool->push([&, query_el_idx = query_el_i] {
+                knowhere::checkCancellation(op_context);
                 ThreadPool::ScopedSearchOmpSetter setter(1);
 
                 std::vector<int64_t> tmp_labels(k);
@@ -832,8 +942,7 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
                     std::fill(tmp_distances.begin(), tmp_distances.end(),
                               larger_is_closer ? std::numeric_limits<float>::min() : std::numeric_limits<float>::max());
 
-                    BitsetView chunk_bitset = bitset;
-                    chunk_bitset.set_id_offset(xb_id_offset + chunk_idx);
+                    const auto& chunk_bitset = chunk_bitsets[chunk_idx];
 
                     std::vector<size_t> tmp_base_lims = {0, num_base_vectors};
                     auto tmp_base_el_offset = EmbListOffset(tmp_base_lims);
@@ -841,8 +950,8 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
                     auto cur_base = (static_cast<const DataType* const*>(base_tensor))[chunk_idx];
 
                     RETURN_IF_ERROR(brute_force_emb_list_impl<DataType>(
-                        xq, query_el_idx, cur_base, tmp_labels.data(), tmp_distances.data(), k, dim, tmp_base_el_offset,
-                        query_el_offset, el_metric_type, el_sub_metric_type, chunk_bitset, cfg,
+                        xq, query_el_idx, 0, cur_base, tmp_labels.data(), tmp_distances.data(), k, dim,
+                        tmp_base_el_offset, query_el_offset, el_metric_type, el_sub_metric_type, chunk_bitset, cfg,
                         xb_id_offset + chunk_idx));
 
                     // merge chunk-topk results to heap
@@ -912,15 +1021,15 @@ BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr
  */
 template <typename DataType>
 expected<DataSetPtr>
-BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                        const BitsetView& bitset_, milvus::OpContext* op_context) {
+BruteForceRangeSearchImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                          const BitsetView& bitset_, milvus::OpContext* op_context) {
     DataSetPtr query(query_dataset);
     auto xb = base_dataset->GetTensor();
     auto nb = base_dataset->GetRows();
     auto dim = base_dataset->GetDim();
     auto xb_id_offset = base_dataset->GetTensorBeginId();
     BitsetView bitset = bitset_;
-    bitset.set_id_offset(xb_id_offset);
+    PrepareBitsetForInternalRange(bitset, nb, static_cast<size_t>(xb_id_offset));
     auto xq = query_dataset->GetTensor();
     auto nq = query_dataset->GetRows();
 
@@ -933,22 +1042,17 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf range search", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::RADIUS, cfg.radius.value());
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf range search", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::RADIUS, cfg.radius.value());
         if (cfg.range_filter.value() != defaultRangeFilter) {
-            span->SetAttribute(meta::RANGE_FILTER, cfg.range_filter.value());
+            span_ptr->SetAttribute(meta::RANGE_FILTER, cfg.range_filter.value());
         }
-        span->SetAttribute(meta::ROWS, nb);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+        span_ptr->SetAttribute(meta::ROWS, nb);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -994,13 +1098,13 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
     futs.reserve(nq);
     for (int i = 0; i < nq; ++i) {
         futs.emplace_back(pool->push([&, index = i] {
+            knowhere::checkCancellation(op_context);
             if constexpr (std::is_same_v<DataType, knowhere::sparse::SparseRow<float>>) {
                 auto cur_query = static_cast<const sparse::SparseRow<float>*>(xq) + index;
                 auto xb_sparse = static_cast<const sparse::SparseRow<float>*>(xb);
                 std::set<std::pair<float, int64_t>, std::greater<>> result;
                 for (int j = 0; j < nb; ++j) {
-                    auto xid = xb_id_offset + j;
-                    // bitset has already set the id_offset, so we need to use j instead of xid
+                    // j is the chunk-local backend id tested by BitsetView.
                     if (!bitset.empty() && bitset.test(j)) {
                         continue;
                     }
@@ -1013,7 +1117,7 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
                     }
                     auto dist = cur_query->dot(xb_sparse[j], sparse_computer, row_sum);
                     if (dist > radius && dist <= range_filter) {
-                        result.insert({dist, xid});
+                        result.insert({dist, j});
                     }
                 }
                 result_id_array[index].reserve(result.size());
@@ -1100,7 +1204,7 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
                 result_id_array[index].resize(elem_cnt);
                 for (size_t j = 0; j < elem_cnt; j++) {
                     result_dist_array[index][j] = res.distances[j];
-                    result_id_array[index][j] = res.labels[j] + xb_id_offset;
+                    result_id_array[index][j] = res.labels[j];
                 }
                 if (cfg.range_filter.value() != defaultRangeFilter) {
                     FilterRangeSearchResultForOneNq(result_dist_array[index], result_id_array[index],
@@ -1116,28 +1220,24 @@ BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_da
         return expected<DataSetPtr>::Err(ret, "failed to brute force search");
     }
 
+    auto map_status = MapResultIdArray(result_id_array, bitset, xb_id_offset);
+    if (map_status != Status::success) {
+        return expected<DataSetPtr>::Err(map_status, "failed to map brute force range search result ids");
+    }
     auto range_search_result =
         GetRangeSearchResult(result_dist_array, result_id_array, the_larger_the_closer, nq, radius, range_filter);
     auto res = GenResultDataSet(nq, std::move(range_search_result));
-
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
 
     return res;
 }
 
 Status
-BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, sparse::label_t* labels,
-                                float* distances, const Json& config, const BitsetView& bitset,
-                                milvus::OpContext* op_context) {
+SearchSparseWithBufImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, sparse::label_t* labels,
+                        float* distances, const Json& config, BitsetView bitset, milvus::OpContext* op_context) {
     auto base = static_cast<const sparse::SparseRow<float>*>(base_dataset->GetTensor());
     auto rows = base_dataset->GetRows();
     auto xb_id_offset = base_dataset->GetTensorBeginId();
+    PrepareBitsetForInternalRange(bitset, rows, static_cast<size_t>(xb_id_offset));
 
     auto xq = static_cast<const sparse::SparseRow<float>*>(query_dataset->GetTensor());
     auto nq = query_dataset->GetRows();
@@ -1153,19 +1253,15 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
     auto dim = base_dataset->GetDim();
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf search sparse with buf", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::TOPK, cfg.k.value());
-        span->SetAttribute(meta::ROWS, rows);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span =
+        knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf search sparse with buf", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::TOPK, cfg.k.value());
+        span_ptr->SetAttribute(meta::ROWS, rows);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1188,6 +1284,7 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
     futs.reserve(nq);
     for (int64_t i = 0; i < nq; ++i) {
         futs.emplace_back(pool->push([&, index = i] {
+            knowhere::checkCancellation(op_context);
             auto cur_labels = labels + topk * index;
             auto cur_distances = distances + topk * index;
 
@@ -1197,8 +1294,7 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
             }
             ResultMinHeap<float, int64_t> heap(topk);
             for (int64_t j = 0; j < rows; ++j) {
-                auto x_id = j + xb_id_offset;
-                if (!bitset.empty() && bitset.test(x_id)) {
+                if (!bitset.empty() && bitset.test(j)) {
                     continue;
                 }
                 float row_sum = 0;
@@ -1210,7 +1306,7 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
                 }
                 float dist = row.dot(base[j], computer, row_sum);
                 if (dist > 0) {
-                    heap.Push(dist, x_id);
+                    heap.Push(dist, j);
                 }
             }
             heap.Finalize();
@@ -1222,21 +1318,14 @@ BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr 
         }));
     }
     WaitAllSuccess(futs);
-
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
+    RETURN_IF_ERROR(MapResultIds(labels, nq * topk, bitset, xb_id_offset));
 
     return Status::success;
 }
 
 expected<DataSetPtr>
-BruteForce::SearchSparse(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                         const BitsetView& bitset, milvus::OpContext* op_context) {
+BruteForceSearchSparseImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                           const BitsetView& bitset, milvus::OpContext* op_context) {
     auto nq = query_dataset->GetRows();
     BruteForceConfig cfg;
     std::string msg;
@@ -1249,18 +1338,22 @@ BruteForce::SearchSparse(const DataSetPtr base_dataset, const DataSetPtr query_d
     auto labels = std::make_unique<sparse::label_t[]>(nq * topk);
     auto distances = std::make_unique<float[]>(nq * topk);
 
-    SearchSparseWithBuf(base_dataset, query_dataset, labels.get(), distances.get(), config, bitset, op_context);
+    auto search_status =
+        SearchSparseWithBufImpl(base_dataset, query_dataset, labels.get(), distances.get(), config, bitset, op_context);
+    if (search_status != Status::success) {
+        return expected<DataSetPtr>::Err(search_status, "sparse search failed");
+    }
     return GenResultDataSet(nq, topk, std::move(labels), std::move(distances));
 }
 
 template <typename DataType>
 expected<std::vector<IndexNode::IteratorPtr>>
-BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                        const BitsetView& bitset_, bool use_knowhere_search_pool, milvus::OpContext* op_context) {
+BruteForceAnnIteratorImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                          const BitsetView& bitset_, bool use_knowhere_search_pool, milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (base_is_chunk) {
-        return AnnIteratorOnChunk<DataType>(base_dataset, query_dataset, config, bitset_, use_knowhere_search_pool,
-                                            op_context);
+        return BruteForceAnnIteratorOnChunkImpl<DataType>(base_dataset, query_dataset, config, bitset_,
+                                                          use_knowhere_search_pool, op_context);
     }
     auto nb = base_dataset->GetRows();
     auto dim = base_dataset->GetDim();
@@ -1285,18 +1378,14 @@ BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_da
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf ann iterator initialization", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::ROWS, nb);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf ann iterator initialization",
+                                                                       op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::ROWS, nb);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1309,6 +1398,10 @@ BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_da
     }
     auto vec = std::vector<IndexNode::IteratorPtr>(nq, nullptr);
     std::shared_ptr<float[]> inv_norms = GetInverseVecNorms<DataType>(base_dataset);
+    auto bitset_state = std::make_shared<PreparedBitsetState>();
+    auto xb_id_offset = base_dataset->GetTensorBeginId();
+    bitset_state->bitset = bitset_;
+    PrepareBitsetForInternalRange(bitset_state->bitset, nb, static_cast<size_t>(xb_id_offset));
 
     try {
         for (int i = 0; i < nq; ++i) {
@@ -1316,11 +1409,9 @@ BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_da
             auto compute_dist_func = [=]() -> std::vector<DistId> {
                 auto xb = base_dataset->GetTensor();
                 auto xq = query_dataset->GetTensor();
-                auto xb_id_offset = base_dataset->GetTensorBeginId();
-                BitsetView bitset = bitset_;
-                bitset.set_id_offset(xb_id_offset);
-                BitsetViewIDSelector bw_idselector(bitset);
-                [[maybe_unused]] faiss::IDSelector* id_selector = (bitset.empty()) ? nullptr : &bw_idselector;
+                BitsetViewIDSelector bw_idselector(bitset_state->bitset);
+                [[maybe_unused]] faiss::IDSelector* id_selector =
+                    !bitset_state->bitset.empty() ? &bw_idselector : nullptr;
                 auto max_dis =
                     larger_is_closer ? std::numeric_limits<float>::lowest() : std::numeric_limits<float>::max();
                 std::vector<DistId> distances_ids(nb, {-1, max_dis});
@@ -1424,35 +1515,27 @@ BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_da
                         KNOWHERE_THROW_MSG(err_msg);
                     }
                 }
-                if (xb_id_offset != 0) {
-                    for (auto& distances_id : distances_ids) {
-                        distances_id.id = distances_id.id == -1 ? -1 : distances_id.id + xb_id_offset;
-                    }
-                }
+                MapDistIdsOrThrow(distances_ids, bitset_state->bitset, xb_id_offset);
                 return distances_ids;
             };
             vec[i] = std::make_shared<PrecomputedDistanceIterator>(compute_dist_func, larger_is_closer,
                                                                    use_knowhere_search_pool);
         }
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::brute_force_inner_error, e.what());
     }
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
     return vec;
 }
 
 template <typename DataType>
 expected<std::vector<IndexNode::IteratorPtr>>
-BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
-                               const BitsetView& bitset_, bool use_knowhere_search_pool,
-                               milvus::OpContext* op_context) {
+BruteForceAnnIteratorOnChunkImpl(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                                 const BitsetView& bitset_, bool use_knowhere_search_pool,
+                                 milvus::OpContext* op_context) {
     auto base_is_chunk = base_dataset->GetIsChunk();
     if (!base_is_chunk) {
         LOG_KNOWHERE_ERROR_ << "Base dataset is not chunk, should NOT use it.";
@@ -1515,21 +1598,32 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
     bool is_cosine = IsMetricType(metric_str, metric::COSINE);
     auto vec = std::vector<IndexNode::IteratorPtr>(nq, nullptr);
     std::shared_ptr<float[]> inv_norms = GetInverseVecNorms<DataType>(base_dataset);
+    auto bitset_state = std::make_shared<PreparedBitsetState>();
+    auto xb_id_offset = base_dataset->GetTensorBeginId();
+    bitset_state->chunk_bitsets.resize(num_chunk);
+    for (int chunk_idx = 0; chunk_idx < num_chunk; ++chunk_idx) {
+        const size_t num_base_vectors = chunk_lims[chunk_idx + 1] - chunk_lims[chunk_idx];
+        bitset_state->chunk_bitsets[chunk_idx] = bitset_;
+        auto window_status =
+            UseOutIdsWindow(bitset_state->chunk_bitsets[chunk_idx], chunk_lims[chunk_idx], num_base_vectors);
+        if (window_status != Status::success) {
+            return expected<std::vector<IndexNode::IteratorPtr>>::Err(window_status,
+                                                                      "failed to prepare brute-force out id map");
+        }
+        PrepareBitsetForInternalRange(bitset_state->chunk_bitsets[chunk_idx], num_base_vectors,
+                                      static_cast<size_t>(xb_id_offset) + chunk_lims[chunk_idx]);
+    }
 
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf ann iterator initialization", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
-        span->SetAttribute(meta::ROWS, num_total_vectors);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf ann iterator initialization",
+                                                                       op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, cfg.metric_type.value());
+        span_ptr->SetAttribute(meta::ROWS, num_total_vectors);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1540,7 +1634,6 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
             auto compute_dist_func = [=]() -> std::vector<DistId> {
                 auto chunk_tensor = static_cast<const DataType* const*>(base_dataset->GetTensor());
                 auto xq = query_dataset->GetTensor();
-                auto xb_id_offset = base_dataset->GetTensorBeginId();
 
                 auto max_dis =
                     larger_is_closer ? std::numeric_limits<float>::lowest() : std::numeric_limits<float>::max();
@@ -1555,10 +1648,9 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
                     const size_t num_base_vectors = chunk_lims[chunk_idx + 1] - chunk_lims[chunk_idx];
                     auto xb = chunk_tensor[chunk_idx];
 
-                    BitsetView bitset = bitset_;
-                    bitset.set_id_offset(xb_id_offset + chunk_lims[chunk_idx]);
-                    BitsetViewIDSelector bw_idselector(bitset);
-                    [[maybe_unused]] faiss::IDSelector* id_selector = (bitset.empty()) ? nullptr : &bw_idselector;
+                    const auto& chunk_bitset = bitset_state->chunk_bitsets[chunk_idx];
+                    BitsetViewIDSelector bw_idselector(chunk_bitset);
+                    [[maybe_unused]] faiss::IDSelector* id_selector = !chunk_bitset.empty() ? &bw_idselector : nullptr;
                     std::vector<DistId> chunk_distances_ids(num_base_vectors, {-1, max_dis});
 
                     switch (faiss_metric_type) {
@@ -1576,14 +1668,9 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
                                 LOG_KNOWHERE_ERROR_ << err_msg;
                                 KNOWHERE_THROW_MSG(err_msg);
                             }
-                            // copy chunk_distances_ids to distances_ids
-                            for (size_t j = 0; j < num_base_vectors; ++j) {
-                                distances_ids[chunk_lims[chunk_idx] + j].id =
-                                    chunk_distances_ids[j].id == -1
-                                        ? -1
-                                        : chunk_distances_ids[j].id + xb_id_offset + chunk_lims[chunk_idx];
-                                distances_ids[chunk_lims[chunk_idx] + j].val = chunk_distances_ids[j].val;
-                            }
+                            CopyMappedChunkDistIds(distances_ids, chunk_lims[chunk_idx], chunk_distances_ids,
+                                                   chunk_bitset,
+                                                   xb_id_offset + static_cast<int64_t>(chunk_lims[chunk_idx]));
                             break;
                         }
                         case faiss::METRIC_INNER_PRODUCT: {
@@ -1605,14 +1692,9 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
                                     LOG_KNOWHERE_ERROR_ << err_msg;
                                     KNOWHERE_THROW_MSG(err_msg);
                                 }
-                                // copy chunk_distances_ids to distances_ids
-                                for (size_t j = 0; j < num_base_vectors; ++j) {
-                                    distances_ids[chunk_lims[chunk_idx] + j].id =
-                                        chunk_distances_ids[j].id == -1
-                                            ? -1
-                                            : chunk_distances_ids[j].id + xb_id_offset + chunk_lims[chunk_idx];
-                                    distances_ids[chunk_lims[chunk_idx] + j].val = chunk_distances_ids[j].val;
-                                }
+                                CopyMappedChunkDistIds(distances_ids, chunk_lims[chunk_idx], chunk_distances_ids,
+                                                       chunk_bitset,
+                                                       xb_id_offset + static_cast<int64_t>(chunk_lims[chunk_idx]));
                             } else {
                                 if constexpr (std::is_same_v<DataType, knowhere::fp32>) {
                                     faiss::cppcontrib::knowhere::all_inner_product(
@@ -1627,14 +1709,9 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
                                     LOG_KNOWHERE_ERROR_ << err_msg;
                                     KNOWHERE_THROW_MSG(err_msg);
                                 }
-                                // copy chunk_distances_ids to distances_ids
-                                for (size_t j = 0; j < num_base_vectors; ++j) {
-                                    distances_ids[chunk_lims[chunk_idx] + j].id =
-                                        chunk_distances_ids[j].id == -1
-                                            ? -1
-                                            : chunk_distances_ids[j].id + xb_id_offset + chunk_lims[chunk_idx];
-                                    distances_ids[chunk_lims[chunk_idx] + j].val = chunk_distances_ids[j].val;
-                                }
+                                CopyMappedChunkDistIds(distances_ids, chunk_lims[chunk_idx], chunk_distances_ids,
+                                                       chunk_bitset,
+                                                       xb_id_offset + static_cast<int64_t>(chunk_lims[chunk_idx]));
                             }
                             break;
                         }
@@ -1649,8 +1726,11 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
                                         distances_ids[chunk_lims[chunk_idx] + j].id = -1;
                                         distances_ids[chunk_lims[chunk_idx] + j].val = max_dis;
                                     } else {
-                                        distances_ids[chunk_lims[chunk_idx] + j].id =
-                                            xb_id_offset + chunk_lims[chunk_idx] + j;
+                                        auto global_id = static_cast<int64_t>(j);
+                                        MapOneResultIdOrThrow(
+                                            global_id, chunk_bitset,
+                                            xb_id_offset + static_cast<int64_t>(chunk_lims[chunk_idx]));
+                                        distances_ids[chunk_lims[chunk_idx] + j].id = global_id;
                                         distances_ids[chunk_lims[chunk_idx] + j].val = static_cast<float>(distances[j]);
                                     }
                                 }
@@ -1672,8 +1752,11 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
                                         distances_ids[chunk_lims[chunk_idx] + j].id = -1;
                                         distances_ids[chunk_lims[chunk_idx] + j].val = max_dis;
                                     } else {
-                                        distances_ids[chunk_lims[chunk_idx] + j].id =
-                                            xb_id_offset + chunk_lims[chunk_idx] + j;
+                                        auto global_id = static_cast<int64_t>(j);
+                                        MapOneResultIdOrThrow(
+                                            global_id, chunk_bitset,
+                                            xb_id_offset + static_cast<int64_t>(chunk_lims[chunk_idx]));
+                                        distances_ids[chunk_lims[chunk_idx] + j].id = global_id;
                                         distances_ids[chunk_lims[chunk_idx] + j].val = distances[j];
                                     }
                                 }
@@ -1696,6 +1779,9 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
             vec[i] = std::make_shared<PrecomputedDistanceIterator>(compute_dist_func, larger_is_closer,
                                                                    use_knowhere_search_pool);
         }
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::brute_force_inner_error, e.what());
     }
@@ -1705,12 +1791,11 @@ BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr q
 
 template <>
 expected<std::vector<IndexNode::IteratorPtr>>
-BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr base_dataset,
-                                                            const DataSetPtr query_dataset, const Json& config,
-                                                            const BitsetView& bitset, bool use_knowhere_search_pool,
-                                                            milvus::OpContext* op_context) {
+BruteForceAnnIteratorImpl<knowhere::sparse::SparseRow<float>>(const DataSetPtr base_dataset,
+                                                              const DataSetPtr query_dataset, const Json& config,
+                                                              const BitsetView& bitset, bool use_knowhere_search_pool,
+                                                              milvus::OpContext* op_context) {
     auto rows = base_dataset->GetRows();
-    auto xb_id_offset = base_dataset->GetTensorBeginId();
     auto nq = query_dataset->GetRows();
 
     BruteForceConfig cfg;
@@ -1727,18 +1812,13 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
 #if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
     // LCOV_EXCL_START
     auto dim = base_dataset->GetDim();
-    std::shared_ptr<tracer::trace::Span> span = nullptr;
-    if (cfg.trace_id.has_value()) {
-        auto trace_id_str = tracer::GetIDFromHexStr(cfg.trace_id.value());
-        auto span_id_str = tracer::GetIDFromHexStr(cfg.span_id.value());
-        auto ctx = tracer::TraceContext{.traceID = reinterpret_cast<const uint8_t*>(trace_id_str.c_str()),
-                                        .spanID = reinterpret_cast<const uint8_t*>(span_id_str.c_str()),
-                                        .traceFlags = static_cast<uint8_t>(cfg.trace_flags.value())};
-        span = tracer::StartSpan("knowhere bf iterator sparse", &ctx);
-        span->SetAttribute(meta::METRIC_TYPE, metric_str);
-        span->SetAttribute(meta::ROWS, rows);
-        span->SetAttribute(meta::DIM, dim);
-        span->SetAttribute(meta::NQ, nq);
+    auto span = knowhere::tracer::StartMilvusSpanFromOpContextOrConfig("knowhere bf iterator sparse", op_context, cfg);
+    auto span_ptr = span != nullptr ? span->GetSpan() : milvus::tracer::SpanPtr{};
+    if (span_ptr != nullptr) {
+        span_ptr->SetAttribute(meta::METRIC_TYPE, metric_str);
+        span_ptr->SetAttribute(meta::ROWS, rows);
+        span_ptr->SetAttribute(meta::DIM, dim);
+        span_ptr->SetAttribute(meta::NQ, nq);
     }
     // LCOV_EXCL_STOP
 #endif
@@ -1752,6 +1832,10 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
     auto computer = computer_or.value();
 
     auto vec = std::vector<IndexNode::IteratorPtr>(nq, nullptr);
+    auto bitset_state = std::make_shared<PreparedBitsetState>();
+    auto xb_id_offset = base_dataset->GetTensorBeginId();
+    bitset_state->bitset = bitset;
+    PrepareBitsetForInternalRange(bitset_state->bitset, rows, static_cast<size_t>(xb_id_offset));
     try {
         for (int64_t i = 0; i < nq; ++i) {
             // Heavy computations with `compute_dist_func` will be deferred until the first call to 'Iterator->Next()'.
@@ -1762,8 +1846,7 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
                 std::vector<DistId> distances_ids;
                 if (row.size() > 0) {
                     for (int64_t j = 0; j < rows; ++j) {
-                        auto xb_id = j + xb_id_offset;
-                        if (!bitset.empty() && bitset.test(xb_id)) {
+                        if (!bitset_state->bitset.empty() && bitset_state->bitset.test(j)) {
                             continue;
                         }
                         float row_sum = 0;
@@ -1775,7 +1858,9 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
                         }
                         auto dist = row.dot(base[j], computer, row_sum);
                         if (dist > 0) {
-                            distances_ids.emplace_back(xb_id, dist);
+                            auto id = j;
+                            MapOneResultIdOrThrow(id, bitset_state->bitset, xb_id_offset);
+                            distances_ids.emplace_back(id, dist);
                         }
                     }
                 }
@@ -1784,19 +1869,91 @@ BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(const DataSetPtr bas
 
             vec[i] = std::make_shared<PrecomputedDistanceIterator>(compute_dist_func, true, use_knowhere_search_pool);
         }
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         return expected<std::vector<IndexNode::IteratorPtr>>::Err(Status::brute_force_inner_error, e.what());
     }
 
-#if defined(NOT_COMPILE_FOR_SWIG) && !defined(KNOWHERE_WITH_LIGHT)
-    // LCOV_EXCL_START
-    if (cfg.trace_id.has_value()) {
-        span->End();
-    }
-    // LCOV_EXCL_STOP
-#endif
-
     return vec;
+}
+
+template <typename DataType>
+expected<DataSetPtr>
+BruteForce::Search(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                   const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        return BruteForceSearchImpl<DataType>(base_dataset, query_dataset, config, bitset, op_context);
+    });
+}
+
+template <typename DataType>
+Status
+BruteForce::SearchWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids, float* dis,
+                          const Json& config, const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> Status {
+        return BruteForceSearchWithBufImpl<DataType>(base_dataset, query_dataset, ids, dis, config, bitset, op_context);
+    });
+}
+
+template <typename DataType>
+Status
+BruteForce::SearchOnChunkWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, int64_t* ids,
+                                 float* dis, const Json& config, const BitsetView& bitset,
+                                 milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> Status {
+        return BruteForceSearchOnChunkWithBufImpl<DataType>(base_dataset, query_dataset, ids, dis, config, bitset,
+                                                            op_context);
+    });
+}
+
+template <typename DataType>
+expected<DataSetPtr>
+BruteForce::RangeSearch(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                        const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        return BruteForceRangeSearchImpl<DataType>(base_dataset, query_dataset, config, bitset, op_context);
+    });
+}
+
+Status
+BruteForce::SearchSparseWithBuf(const DataSetPtr base_dataset, const DataSetPtr query_dataset, sparse::label_t* labels,
+                                float* distances, const Json& config, const BitsetView& bitset,
+                                milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> Status {
+        return SearchSparseWithBufImpl(base_dataset, query_dataset, labels, distances, config, bitset, op_context);
+    });
+}
+
+expected<DataSetPtr>
+BruteForce::SearchSparse(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                         const BitsetView& bitset, milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        return BruteForceSearchSparseImpl(base_dataset, query_dataset, config, bitset, op_context);
+    });
+}
+
+template <typename DataType>
+expected<std::vector<IndexNode::IteratorPtr>>
+BruteForce::AnnIterator(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                        const BitsetView& bitset, bool use_knowhere_search_pool,
+                        milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<std::vector<IndexNode::IteratorPtr>> {
+        return BruteForceAnnIteratorImpl<DataType>(base_dataset, query_dataset, config, bitset,
+                                                   use_knowhere_search_pool, op_context);
+    });
+}
+
+template <typename DataType>
+expected<std::vector<IndexNode::IteratorPtr>>
+BruteForce::AnnIteratorOnChunk(const DataSetPtr base_dataset, const DataSetPtr query_dataset, const Json& config,
+                               const BitsetView& bitset, bool use_knowhere_search_pool,
+                               milvus::OpContext* op_context) noexcept {
+    return GuardedCall([&]() -> expected<std::vector<IndexNode::IteratorPtr>> {
+        return BruteForceAnnIteratorOnChunkImpl<DataType>(base_dataset, query_dataset, config, bitset,
+                                                          use_knowhere_search_pool, op_context);
+    });
 }
 
 template knowhere::expected<knowhere::DataSetPtr>
@@ -1903,5 +2060,9 @@ knowhere::BruteForce::AnnIterator<knowhere::bin1>(const knowhere::DataSetPtr bas
                                                   const knowhere::DataSetPtr query_dataset,
                                                   const knowhere::Json& config, const knowhere::BitsetView& bitset,
                                                   bool use_knowhere_search_pool, milvus::OpContext* op_context);
+template knowhere::expected<std::vector<knowhere::IndexNode::IteratorPtr>>
+knowhere::BruteForce::AnnIterator<knowhere::sparse::SparseRow<float>>(
+    const knowhere::DataSetPtr base_dataset, const knowhere::DataSetPtr query_dataset, const knowhere::Json& config,
+    const knowhere::BitsetView& bitset, bool use_knowhere_search_pool, milvus::OpContext* op_context);
 
 }  // namespace knowhere

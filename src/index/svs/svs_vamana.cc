@@ -22,8 +22,10 @@
 #include "faiss/svs/IndexSVSVamanaLVQ.h"
 #include "faiss/svs/IndexSVSVamanaLeanVec.h"
 #include "index/svs/svs_config.h"
+#include "index/svs/svs_utils.h"
 #include "io/memory_io.h"
 #include "knowhere/bitsetview_idselector.h"
+#include "knowhere/comp/index_param.h"
 #include "knowhere/comp/task.h"
 #include "knowhere/context.h"
 #include "knowhere/feature.h"
@@ -34,33 +36,6 @@
 #include "knowhere/utils.h"
 
 namespace knowhere {
-
-namespace {
-
-std::optional<faiss::SVSStorageKind>
-str_to_svs_storage_kind(const std::string& s) {
-    if (s == "fp32")
-        return faiss::SVS_FP32;
-    if (s == "fp16")
-        return faiss::SVS_FP16;
-    if (s == "sqi8")
-        return faiss::SVS_SQI8;
-    if (s == "lvq4x0")
-        return faiss::SVS_LVQ4x0;
-    if (s == "lvq4x4")
-        return faiss::SVS_LVQ4x4;
-    if (s == "lvq4x8")
-        return faiss::SVS_LVQ4x8;
-    if (s == "leanvec4x4")
-        return faiss::SVS_LeanVec4x4;
-    if (s == "leanvec4x8")
-        return faiss::SVS_LeanVec4x8;
-    if (s == "leanvec8x8")
-        return faiss::SVS_LeanVec8x8;
-    return std::nullopt;
-}
-
-}  // namespace
 
 template <typename DataType>
 class SvsVamanaIndexNode : public IndexNode {
@@ -114,6 +89,16 @@ class SvsVamanaIndexNode : public IndexNode {
         if (!index_) {
             LOG_KNOWHERE_ERROR_ << "Can not add data to empty index.";
             return Status::empty_index;
+        }
+
+        // A static index consumes all of its data in the first add() and cannot be extended afterwards. Report
+        // that as an explicit unsupported-operation rather than letting the faiss throw surface as an inner error.
+        if (index_->is_static && index_->impl != nullptr) {
+            LOG_KNOWHERE_ERROR_ << "SVS Vamana index was built as static (" << indexparam::SVS_IS_STATIC
+                                << "=true) and does not support incremental add; all data must be supplied in a "
+                                   "single Add call, or set "
+                                << indexparam::SVS_IS_STATIC << "=false to build the dynamic variant.";
+            return Status::not_implemented;
         }
 
         const SvsVamanaConfig& v_cfg = static_cast<const SvsVamanaConfig&>(*cfg);
@@ -173,7 +158,7 @@ class SvsVamanaIndexNode : public IndexNode {
                     sp.search_window_size = v_cfg.svs_search_window_size.value();
                     sp.search_buffer_capacity = v_cfg.svs_search_buffer_capacity.value();
                     std::unique_ptr<BitsetViewIDSelector> bw_idselector;
-                    if (!bitset.empty()) {
+                    if (!bitset.empty() || bitset.num_bits() != 0) {
                         bw_idselector = std::make_unique<BitsetViewIDSelector>(bitset);
                         sp.sel = bw_idselector.get();
                     }
@@ -182,12 +167,17 @@ class SvsVamanaIndexNode : public IndexNode {
                 }));
             }
             WaitAllSuccess(futs);
+        } catch (const folly::FutureCancellation& e) {
+            LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+            return expected<DataSetPtr>::Err(Status::cancelled, e.what());
         } catch (const std::exception& e) {
             LOG_KNOWHERE_WARNING_ << "error inner faiss: " << e.what();
             return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
         }
 
-        return GenResultDataSet(nq, k, std::move(ids), std::move(distances));
+        auto res = GenResultDataSet(nq, k, std::move(ids), std::move(distances));
+        MapSearchResultIdsToOutIds(res);
+        return res;
     }
 
     expected<DataSetPtr>
@@ -229,7 +219,7 @@ class SvsVamanaIndexNode : public IndexNode {
                     sp.search_window_size = v_cfg.svs_search_window_size.value();
                     sp.search_buffer_capacity = v_cfg.svs_search_buffer_capacity.value();
                     std::unique_ptr<BitsetViewIDSelector> bw_idselector;
-                    if (!bitset.empty()) {
+                    if (!bitset.empty() || bitset.num_bits() != 0) {
                         bw_idselector = std::make_unique<BitsetViewIDSelector>(bitset);
                         sp.sel = bw_idselector.get();
                     }
@@ -253,7 +243,12 @@ class SvsVamanaIndexNode : public IndexNode {
             WaitAllSuccess(futs);
             auto range_search_result =
                 GetRangeSearchResult(result_dist_array, result_id_array, is_similarity, nq, radius, range_filter);
-            return GenResultDataSet(nq, std::move(range_search_result));
+            auto res = GenResultDataSet(nq, std::move(range_search_result));
+            MapSearchResultIdsToOutIds(res);
+            return res;
+        } catch (const folly::FutureCancellation& e) {
+            LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+            return expected<DataSetPtr>::Err(Status::cancelled, e.what());
         } catch (const std::exception& e) {
             LOG_KNOWHERE_WARNING_ << "error inner faiss: " << e.what();
             return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
@@ -402,7 +397,9 @@ class SvsVamanaIndexNode : public IndexNode {
     virtual std::unique_ptr<faiss::IndexSVSVamana>
     CreateFaissIndex(int64_t dim, int64_t degree, faiss::MetricType metric, faiss::SVSStorageKind storage,
                      const SvsVamanaConfig& cfg) {
-        return std::make_unique<faiss::IndexSVSVamana>(dim, degree, metric, storage);
+        // Knowhere does not use SVS Vamana stored vectors
+        return std::make_unique<faiss::IndexSVSVamana>(dim, degree, metric, storage, cfg.svs_is_static.value(),
+                                                       /*store_vectors=*/false);
     }
 
     std::unique_ptr<faiss::IndexSVSVamana> index_;
@@ -443,7 +440,8 @@ class SvsVamanaLvqIndexNode : public SvsVamanaIndexNode<DataType> {
     std::unique_ptr<faiss::IndexSVSVamana>
     CreateFaissIndex(int64_t dim, int64_t degree, faiss::MetricType metric, faiss::SVSStorageKind storage,
                      const SvsVamanaConfig& cfg) override {
-        return std::make_unique<faiss::IndexSVSVamanaLVQ>(dim, degree, metric, storage);
+        return std::make_unique<faiss::IndexSVSVamanaLVQ>(dim, degree, metric, storage, cfg.svs_is_static.value(),
+                                                          /*store_vectors=*/false);
     }
 };
 
@@ -481,7 +479,8 @@ class SvsVamanaLeanVecIndexNode : public SvsVamanaIndexNode<DataType> {
         try {
             size_t leanvec_dim = lv_cfg.svs_leanvec_dim.value();
             auto idx = std::make_unique<faiss::IndexSVSVamanaLeanVec>(
-                dataset->GetDim(), lv_cfg.svs_graph_max_degree.value(), metric.value(), leanvec_dim, storage.value());
+                dataset->GetDim(), lv_cfg.svs_graph_max_degree.value(), metric.value(), leanvec_dim, storage.value(),
+                lv_cfg.svs_is_static.value(), /*store_vectors=*/false);
             idx->construction_window_size = lv_cfg.svs_construction_window_size.value();
             if (lv_cfg.svs_alpha.has_value()) {
                 idx->alpha = lv_cfg.svs_alpha.value();
@@ -490,7 +489,29 @@ class SvsVamanaLeanVecIndexNode : public SvsVamanaIndexNode<DataType> {
             idx->search_buffer_capacity = lv_cfg.svs_search_buffer_capacity.value();
 
             // LeanVec requires training before adding vectors
-            idx->train(dataset->GetRows(), (const float*)dataset->GetTensor());
+            const auto n = dataset->GetRows();
+            const auto dim = dataset->GetDim();
+            const auto* data = (const float*)dataset->GetTensor();
+            if (lv_cfg.svs_leanvec_ood.value_or(true)) {
+                // OOD: learn the projection from a representative query sample if one is attached
+                // to the train dataset, otherwise fall back to the database vectors themselves.
+                const auto* queries = dataset->Get<const float*>(meta::TRAIN_QUERY_TENSOR);
+                const int64_t n_queries = dataset->Get<int64_t>(meta::TRAIN_QUERY_ROWS);
+                std::unique_ptr<float[]> normalized_queries;
+                if (queries != nullptr && n_queries > 0) {
+                    if (is_cosine) {
+                        normalized_queries = CopyAndNormalizeVecs(queries, n_queries, dim);
+                        queries = normalized_queries.get();
+                    }
+                    idx->train_with_queries(n, data, n_queries, queries);
+                } else {
+                    LOG_KNOWHERE_DEBUG_ << "svs_leanvec_ood set without query vectors; "
+                                        << "falling back to in-distribution training on database vectors";
+                    idx->train_with_queries(n, data, n, data);
+                }
+            } else {
+                idx->train(n, data);
+            }
 
             this->index_ = std::move(idx);
         } catch (const std::exception& e) {

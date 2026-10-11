@@ -45,6 +45,7 @@ class KnowhereConan(ConanFile):
         "with_diskann": False,
         "with_svs": False,
         "with_cardinal": False,
+        "metis/*:with_64bit_types": True,
         "cardinal_version_force_checkout": False,
         "with_profiler": False,
         "with_ut": False,
@@ -114,9 +115,11 @@ class KnowhereConan(ConanFile):
             self.options["openblas"].dynamic_arch = True
 
     def requirements(self):
+        if self.options.with_cardinal:
+            self.requires("metis/5.2.1#85cfe7ee0dfc0cba7c0334e92efcbbc6")
         self.requires("abseil/20250127.0#481edcc75deb0efb16500f511f0f0a1c")
         self.requires("boost/1.83.0#4e8a94ac1b88312af95eded83cd81ca8")
-        self.requires("milvus-common/1.0.0-9ca5ea6@milvus/dev#274d428d85f1d3d996e1092f0c9c7144")
+        self.requires("milvus-common/1.0.0-45fca32@milvus/dev#ac7e38699c9dcc9a83d5be95e8227900")
         self.requires("gflags/2.2.2#7671803f1dc19354cc90bd32874dcfda")
         self.requires("glog/0.7.1#a306e61d7b8311db8cb148ad62c48030")
         self.requires("nlohmann_json/3.11.3#ffb9e9236619f1c883e36662f944345d", force=True)
@@ -138,7 +141,7 @@ class KnowhereConan(ConanFile):
         self.requires("simde/0.8.2#5e1edfd5cba92f25d79bf6ef4616b972")
         self.requires("xxhash/0.8.3#caa6d0af1b951c247922e38fbcebdbe6")
         if self.settings.os == "Linux":
-            self.requires("openblas/0.3.30")
+            self.requires("openblas/0.3.30#aca4131c143d4c109923372e052c643c")
         if not self.options.with_light:
             self.requires("opentelemetry-cpp/1.23.0@milvus/dev#11bc565ec6e82910ae8f7471da756720")
         if self.settings.os != "Macos":

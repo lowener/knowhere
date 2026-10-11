@@ -19,6 +19,7 @@
 #include "faiss/IndexIVFRaBitQ.h"
 #include "faiss/IndexIVFRaBitQFastScan.h"
 #include "faiss/IndexRefine.h"
+#include "faiss/SuperKMeans.h"
 #include "faiss/VectorTransform.h"
 #include "faiss/cppcontrib/knowhere/IndexBinaryFlat.h"
 #include "faiss/cppcontrib/knowhere/IndexBinaryIVF.h"
@@ -84,12 +85,18 @@ class IvfIndexNode : public IndexNode {
         build_pool_ = ThreadPool::GetGlobalBuildThreadPool();
         base_index_lock_ = std::make_unique<FairRWLock>();
     }
+
+    bool
+    NeedBitsetExactCount() const override {
+        return true;
+    }
+
     Status
     BuildEmbList(const DataSetPtr dataset, std::shared_ptr<Config> cfg, const size_t* lims, size_t num_rows,
-                 bool use_knowhere_build_pool) override {
+                 size_t num_el, bool use_knowhere_build_pool) override {
         if constexpr (std::is_same_v<IndexType, faiss::cppcontrib::knowhere::IndexIVFFlat> ||
                       std::is_same_v<IndexType, faiss::cppcontrib::knowhere::IndexIVFFlatCC>) {
-            return IndexNode::BuildEmbList(dataset, std::move(cfg), lims, num_rows, use_knowhere_build_pool);
+            return IndexNode::BuildEmbList(dataset, std::move(cfg), lims, num_rows, num_el, use_knowhere_build_pool);
         }
 
         LOG_KNOWHERE_ERROR_ << "BuildEmbList not implemented for current index type";
@@ -131,14 +138,8 @@ class IvfIndexNode : public IndexNode {
         return 4 * dataset->GetDim();
     }
     expected<DataSetPtr>
-    CalcDistByIDs(const DataSetPtr dataset, const BitsetView& bitset, const int64_t* labels, const size_t labels_len,
-                  const bool is_cosine, milvus::OpContext* op_context) const override;
-    Status
-    SetInternalIdToMostExternalIdMap(std::vector<uint32_t>&& map) override {
-        internal_offset_to_most_external_id_ = std::move(map);
-        return Status::success;
-    };
-
+    CalcDistByStorageIds(const DataSetPtr dataset, const BitsetView& bitset, const int64_t* labels,
+                         const size_t labels_len, const bool is_cosine, milvus::OpContext* op_context) const override;
     static Status
     StaticConfigCheck(const Config& cfg, PARAM_TYPE paramType, std::string& msg) {
         auto ivf_cfg = static_cast<const IvfConfig&>(cfg);
@@ -370,6 +371,10 @@ class IvfIndexNode : public IndexNode {
         }
     };
 
+ protected:
+    expected<DataSetPtr>
+    GetVectorByStorageIds(const DataSetPtr dataset, milvus::OpContext* op_context) const override;
+
  private:
     expected<DataSetPtr>
     GetIndexMetaImpl(std::unique_ptr<Config> cfg, IVFBaseTag) const {
@@ -464,7 +469,6 @@ class IvfIndexNode : public IndexNode {
     // spawded during index training/building can inherit the low nice value of
     // threads in build_pool_.
     std::shared_ptr<ThreadPool> build_pool_;
-    std::vector<uint32_t> internal_offset_to_most_external_id_;
     std::unique_ptr<FairRWLock> base_index_lock_;
 };
 
@@ -542,7 +546,7 @@ IvfIndexNode<DataType, IndexType>::Train(const DataSetPtr dataset, std::shared_p
 template <typename DataType, typename IndexType>
 Status
 IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::shared_ptr<Config> cfg) {
-    const BaseConfig& base_cfg = static_cast<const IvfConfig&>(*cfg);
+    const IvfConfig& base_cfg = static_cast<const IvfConfig&>(*cfg);
     std::unique_ptr<ThreadPool::ScopedBuildOmpSetter> setter;
     if (base_cfg.num_build_thread.has_value()) {
         setter = std::make_unique<ThreadPool::ScopedBuildOmpSetter>(base_cfg.num_build_thread.value());
@@ -571,6 +575,13 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
     auto dim = dataset->GetDim();
     auto data = dataset->GetTensor();
 
+    // All numeric IVF variants share the same coarse-training selection.
+    // SuperKMeans requires d >= 2 * d_prime_min (default 32); retain Clustering
+    // below that hard limit, without imposing a minimum nlist. Binary IVF has
+    // a separate training path and does not consume this option.
+    const bool use_super_kmeans = !std::is_same_v<DataType, bin1> && base_cfg.use_super_kmeans.value() &&
+                                  dim >= 2 * faiss::SuperKMeansParameters{}.d_prime_min;
+
     // faiss scann needs at least 16 rows since nbits=4
     constexpr int64_t SCANN_MIN_ROWS = 16;
     if constexpr (std::is_same_v<faiss::cppcontrib::knowhere::IndexScaNN, IndexType>) {
@@ -596,6 +607,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
         }
         // apply clustering config
         ApplyClusteringConfig(index->cp);
+        index->cp.use_super_kmeans = use_super_kmeans;
         // train
         index->train(rows, static_cast<const float*>(data));
         // transfer ownership of qzr to index
@@ -618,6 +630,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
         }
         // apply clustering config
         ApplyClusteringConfig(index->cp);
+        index->cp.use_super_kmeans = use_super_kmeans;
         // train
         index->train(rows, static_cast<const float*>(data));
         // transfer ownership of qzr to index
@@ -649,6 +662,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
 
         // apply clustering config
         ApplyClusteringConfig(index->get_base_ivf_index()->cp);
+        index->get_base_ivf_index()->cp.use_super_kmeans = use_super_kmeans;
         // train
         index->train(rows, static_cast<const float*>(data));
         // transfer ownership of qzr to index
@@ -675,6 +689,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
         }
         // apply clustering config
         ApplyClusteringConfig(base_index->cp);
+        base_index->cp.use_super_kmeans = use_super_kmeans;
         // create scann index, which does not base_index by default,
         //    but owns the refine index by default omg
         if (scann_cfg.with_raw_data.value()) {
@@ -710,6 +725,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
 
         // apply clustering config
         ApplyClusteringConfig(index->get_base_ivf_index()->cp);
+        index->get_base_ivf_index()->cp.use_super_kmeans = use_super_kmeans;
         // train
         index->train(rows, static_cast<const float*>(data));
         // transfer ownership of qzr to index
@@ -757,6 +773,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
         }
         // apply clustering config
         ApplyClusteringConfig(index->cp);
+        index->cp.use_super_kmeans = use_super_kmeans;
         // train
         index->train(rows, static_cast<const float*>(data));
         // transfer ownership of qzr to index
@@ -779,6 +796,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
         index = std::move(result.value());
         // apply clustering config
         ApplyClusteringConfig(index->get_ivfrabitq_index()->cp);
+        index->get_ivfrabitq_index()->cp.use_super_kmeans = use_super_kmeans;
         // train
         index->train(rows, static_cast<const float*>(data));
     }
@@ -795,6 +813,7 @@ IvfIndexNode<DataType, IndexType>::TrainInternal(const DataSetPtr dataset, std::
         auto* fs_idx = index->get_fastscan_index();
         if (fs_idx) {
             ApplyClusteringConfig(fs_idx->cp);
+            fs_idx->cp.use_super_kmeans = use_super_kmeans;
         }
         index->train(rows, static_cast<const float*>(data));
     }
@@ -854,7 +873,6 @@ IvfIndexNode<DataType, IndexType>::AddEmbList(const DataSetPtr dataset, std::sha
         return Status::emb_list_inner_error;
     }
 
-    // 1. split metric_type to el_metric_type and sub_metric_type
     auto& config = static_cast<BaseConfig&>(*cfg);
     auto original_metric_type = config.metric_type.value();
     auto el_metric_type_or = get_el_metric_type(original_metric_type);
@@ -871,43 +889,14 @@ IvfIndexNode<DataType, IndexType>::AddEmbList(const DataSetPtr dataset, std::sha
     auto sub_metric_type = sub_metric_type_or.value();
     config.metric_type = sub_metric_type;
 
-    // 2. update emb_list_offset and id map
     {
         FairWriteLockGuard guard(*this->base_index_lock_);
-        auto old_num_rows = Count();
-        auto old_num_el = emb_list_offset_->num_el();
-        auto dataset_rows = dataset->GetRows();
-        auto new_num_rows = old_num_rows + dataset_rows;
-        if (lims[0] != old_num_rows) {
-            LOG_KNOWHERE_WARNING_ << "lims[0] is not equal to the total_cnt of the old index";
-            return Status::emb_list_inner_error;
-        }
-        size_t idx = 1;
-        internal_offset_to_most_external_id_.resize(new_num_rows);
-        while (lims[idx] < new_num_rows) {
-            if (lims[idx] < lims[idx - 1]) {
-                LOG_KNOWHERE_WARNING_ << "lims is not increasing, lims[" << idx << "] = " << lims[idx] << " < lims["
-                                      << idx - 1 << "] = " << lims[idx - 1];
-                return Status::emb_list_inner_error;
-            }
-            emb_list_offset_->offset.push_back(lims[idx]);
-            auto cur_el_id = old_num_el + idx - 1;
-            std::fill_n(internal_offset_to_most_external_id_.begin() + lims[idx - 1], lims[idx] - lims[idx - 1],
-                        cur_el_id);
-            idx++;
-        }
-        if (lims[idx] != new_num_rows) {
-            LOG_KNOWHERE_WARNING_ << "lims should end with the total_cnt of the new index, lims[" << idx
-                                  << "] = " << lims[idx] << " != " << new_num_rows;
-            return Status::emb_list_inner_error;
-        }
-        emb_list_offset_->offset.push_back(new_num_rows);
-        auto cur_el_id = old_num_el + idx - 1;
-        std::fill_n(internal_offset_to_most_external_id_.begin() + lims[idx - 1], new_num_rows - lims[idx - 1],
-                    cur_el_id);
+        RETURN_IF_ERROR(this->AppendEmbListOffsetAndIdMap(lims, num_rows, GetEmbListCount(dataset)));
     }
 
-    // 3. add to index
+    if (num_rows == 0) {
+        return Status::success;
+    }
     return Add(dataset, std::move(cfg), use_knowhere_build_pool);
 }
 
@@ -934,23 +923,7 @@ IvfIndexNode<DataType, IndexType>::Search(const DataSetPtr dataset, std::unique_
     auto k = ivf_cfg.k.value();
     auto nprobe = ivf_cfg.nprobe.value();
 
-    BitsetView bitset(bitset_);
-    if (!internal_offset_to_most_external_id_.empty()) {
-        if (emb_list_offset_ != nullptr) {
-            // if emb list, manually calculate the number of filtered out ids
-            size_t num_filtered_out_ids = 0;
-            for (size_t i = 0; i < bitset.size(); i++) {
-                if (bitset.test(i)) {
-                    num_filtered_out_ids += emb_list_offset_->offset[i + 1] - emb_list_offset_->offset[i];
-                }
-            }
-            bitset.set_out_ids(internal_offset_to_most_external_id_.data(), internal_offset_to_most_external_id_.size(),
-                               num_filtered_out_ids);
-        } else {
-            bitset.set_out_ids(internal_offset_to_most_external_id_.data(),
-                               internal_offset_to_most_external_id_.size());
-        }
-    }
+    const auto& bitset = bitset_;
 
     auto ids = std::make_unique<int64_t[]>(rows * k);
     auto distances = std::make_unique<float[]>(rows * k);
@@ -1200,12 +1173,16 @@ IvfIndexNode<DataType, IndexType>::Search(const DataSetPtr dataset, std::unique_
         }
         // wait for the completion
         WaitAllSuccess(futs);
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<DataSetPtr>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         LOG_KNOWHERE_WARNING_ << "faiss inner error: " << e.what();
         return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
     }
 
     auto res = GenResultDataSet(rows, k, std::move(ids), std::move(distances));
+    MapSearchResultIdsToOutIds(res);
     return res;
 }
 
@@ -1219,9 +1196,9 @@ IvfIndexNode<DataType, IndexType>::SearchEmbList(const DataSetPtr dataset, std::
 
 template <typename DataType, typename IndexType>
 expected<DataSetPtr>
-IvfIndexNode<DataType, IndexType>::CalcDistByIDs(const DataSetPtr dataset, const BitsetView& bitset,
-                                                 const int64_t* labels, const size_t labels_len, const bool is_cosine,
-                                                 milvus::OpContext* op_context) const {
+IvfIndexNode<DataType, IndexType>::CalcDistByStorageIds(const DataSetPtr dataset, const BitsetView& bitset,
+                                                        const int64_t* labels, const size_t labels_len,
+                                                        const bool is_cosine, milvus::OpContext* op_context) const {
     // When emb_list_raw_index_ exists (MUVERA/LEMUR), base index holds encoded vectors,
     // so use the raw index for exact distance computation during reranking.
     if (emb_list_raw_index_) {
@@ -1234,6 +1211,9 @@ IvfIndexNode<DataType, IndexType>::CalcDistByIDs(const DataSetPtr dataset, const
         auto query_data = dataset->GetTensor();
         auto dim = dataset->GetDim();
         auto distances = std::make_unique<float[]>(num_queries * labels_len);
+        // CalcDistByStorageIds is a refine/rerank primitive: labels are already in the
+        // backend compact id domain. Do not apply nullable public-id mapping here.
+        const int64_t* labels_to_calc = labels;
 
         try {
             std::vector<folly::Future<folly::Unit>> futs;
@@ -1248,7 +1228,7 @@ IvfIndexNode<DataType, IndexType>::CalcDistByIDs(const DataSetPtr dataset, const
                         query = copied_query.get();
                     }
                     auto cur_distances = distances.get() + index * labels_len;
-                    index_->calc_dist_by_ids(1, query, labels_len, labels, cur_distances);
+                    index_->calc_dist_by_ids(1, query, labels_len, labels_to_calc, cur_distances);
                 }));
             }
             WaitAllSuccess(futs);
@@ -1261,7 +1241,8 @@ IvfIndexNode<DataType, IndexType>::CalcDistByIDs(const DataSetPtr dataset, const
     }
 
     // only support IndexIVFFlat and IndexIVFFlatCC
-    return expected<DataSetPtr>::Err(Status::not_implemented, "CalcDistByIDs not implemented for current index type");
+    return expected<DataSetPtr>::Err(Status::not_implemented,
+                                     "CalcDistByStorageIds not implemented for current index type");
 }
 
 template <typename DataType, typename IndexType>
@@ -1527,12 +1508,17 @@ IvfIndexNode<DataType, IndexType>::RangeSearch(const DataSetPtr dataset, std::un
         // wait for the completion
         WaitAllSuccess(futs);
         range_search_result = GetRangeSearchResult(result_dist_array, result_id_array, is_ip, nq, radius, range_filter);
+    } catch (const folly::FutureCancellation& e) {
+        LOG_KNOWHERE_INFO_ << "cancelled by the caller: " << e.what();
+        return expected<DataSetPtr>::Err(Status::cancelled, e.what());
     } catch (const std::exception& e) {
         LOG_KNOWHERE_WARNING_ << "faiss inner error: " << e.what();
         return expected<DataSetPtr>::Err(Status::faiss_inner_error, e.what());
     }
 
-    return GenResultDataSet(nq, std::move(range_search_result));
+    auto res = GenResultDataSet(nq, std::move(range_search_result));
+    MapSearchResultIdsToOutIds(res);
+    return res;
 }
 
 template <typename DataType, typename IndexType>
@@ -1595,6 +1581,8 @@ IvfIndexNode<DataType, IndexType>::AnnIterator(const DataSetPtr dataset, std::un
                 // iterator only own the copied_query.
                 auto it = std::make_shared<iterator>(index_.get(), std::move(copied_query), bitset, nprobe,
                                                      larger_is_closer, iterator_refine_ratio, use_knowhere_search_pool);
+                const auto& id_map = GetIdMap();
+                it->SetResultIdMap(SearchResultIdMap(id_map));
                 vec[i] = it;
             }
 
@@ -1609,6 +1597,32 @@ IvfIndexNode<DataType, IndexType>::AnnIterator(const DataSetPtr dataset, std::un
 template <typename DataType, typename IndexType>
 expected<DataSetPtr>
 IvfIndexNode<DataType, IndexType>::GetVectorByIds(const DataSetPtr dataset, milvus::OpContext* op_context) const {
+    if (dataset == nullptr) {
+        return expected<DataSetPtr>::Err(Status::invalid_args, "GetVectorByIds dataset is null");
+    }
+    auto rows = dataset->GetRows();
+    auto ids = dataset->GetIds();
+    std::vector<int64_t> in_ids;
+    auto status = this->CompactOutToIn(ids, rows, in_ids);
+    if (status != Status::success) {
+        return expected<DataSetPtr>::Err(status, "GetVectorByIds failed to map ids");
+    }
+    ids = in_ids.data();
+    rows = static_cast<int64_t>(in_ids.size());
+    if (rows == 0) {
+        // Public-id retrieve may compact missing nullable ids to an empty
+        // storage-id set. Return an empty vector result without touching
+        // backend storage.
+        return GenResultDataSet(0, Dim(), nullptr);
+    }
+    auto storage_ds = GenIdsDataSet(rows, ids);
+    return GetVectorByStorageIds(storage_ds, op_context);
+}
+
+template <typename DataType, typename IndexType>
+expected<DataSetPtr>
+IvfIndexNode<DataType, IndexType>::GetVectorByStorageIds(const DataSetPtr dataset,
+                                                         milvus::OpContext* op_context) const {
     if (!this->index_) {
         return expected<DataSetPtr>::Err(Status::empty_index, "index not loaded");
     }

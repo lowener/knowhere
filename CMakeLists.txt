@@ -191,8 +191,6 @@ if(WITH_CARDINAL)
   list(APPEND CARDINAL_LIBS cardinalv1)
   add_subdirectory(cmake/libs/cardinal/v2)
   list(APPEND CARDINAL_LIBS cardinalv2)
-  knowhere_file_glob(GLOB_RECURSE KNOWHERE_SPARSE_NODE_SRCS src/index/sparse/sparse_index_node.cc)
-  list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_SPARSE_NODE_SRCS})
 endif()
 
 # Sparse codec C files (not captured by *.cc globs)
@@ -212,6 +210,40 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|amd64)")
     set_source_files_properties(
         src/index/sparse/sindi_simd_avx512.cc
         PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512cd -mavx2 -mfma -mf16c")
+endif()
+
+if(__LOONGARCH64)
+    set_source_files_properties(
+        src/index/sparse/codec/varintdecode.c
+        src/index/sparse/codec/streamvbyte_0124_decode.c
+        src/index/sparse/codec/streamvbyte_0124_encode.c
+        src/index/sparse/codec/simd_bitpacking_kernel.c
+        src/index/sparse/sindi_simd_lsx.cc
+        PROPERTIES COMPILE_OPTIONS "-mlsx;-mno-lasx")
+endif()
+
+if(__AARCH64)
+    set(KNOWHERE_SVE_COMPILE_OPTIONS "")
+    if(HAS_ARMV9_SVE_BF16)
+        set(KNOWHERE_SVE_COMPILE_OPTIONS "-march=armv9-a+sve+bf16")
+    elseif(HAS_ARMV8_SVE_BF16)
+        set(KNOWHERE_SVE_COMPILE_OPTIONS "-march=armv8-a+sve+bf16")
+    elseif(HAS_ARMV9_SVE)
+        set(KNOWHERE_SVE_COMPILE_OPTIONS "-march=armv9-a+sve")
+    elseif(HAS_ARMV8_SVE)
+        set(KNOWHERE_SVE_COMPILE_OPTIONS "-march=armv8-a+sve")
+    endif()
+
+    if(KNOWHERE_SVE_COMPILE_OPTIONS)
+        set_source_files_properties(
+            src/index/sparse/sindi_simd_sve.cc
+            PROPERTIES
+                COMPILE_OPTIONS "${KNOWHERE_SVE_COMPILE_OPTIONS}"
+                COMPILE_DEFINITIONS KNOWHERE_USE_SVE)
+        set_source_files_properties(
+            src/index/sparse/sindi_simd.cc
+            PROPERTIES COMPILE_DEFINITIONS KNOWHERE_USE_SVE)
+    endif()
 endif()
 
 if(WITH_SVS)
@@ -264,6 +296,9 @@ target_link_libraries(knowhere PUBLIC ${KNOWHERE_LINKER_LIBS})
 target_link_libraries(knowhere PUBLIC Boost::boost nlohmann_json::nlohmann_json glog::glog Folly::folly prometheus-cpp::core opentelemetry-cpp::opentelemetry_trace)
 
 if (WITH_CARDINAL)
+  target_compile_definitions(knowhere PRIVATE
+    SPARSE_INDEX_VERSION_USE_RAW_DATA_THRESHOLD=7
+    SPARSE_INDEX_VERSION_SUPPORT_FP16_QUANT_FOR_IP=0)
   target_link_libraries(knowhere PRIVATE "-Wl,--no-as-needed" ${CARDINAL_LIBS} "-Wl,--as-needed")
 endif()
 

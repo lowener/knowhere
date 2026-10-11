@@ -207,9 +207,11 @@ data_type_conversion(const DataSet& src, const std::optional<int64_t> start = st
         } else {
             auto offset_start = lims[0];
             auto offset_end = offset_start + rows;
-            while (lims[lims_size] < offset_end) {
-                lims_size++;
+            auto num_el = src.Get<int64_t>(knowhere::meta::EMB_LIST_COUNT);
+            if (num_el <= 0) {
+                throw std::runtime_error("emb_list dataset must provide a positive EMB_LIST_COUNT.");
             }
+            lims_size = static_cast<size_t>(num_el);
             if (lims[lims_size] != (size_t)offset_end) {
                 throw std::runtime_error("emb_list offsets mismatch with rows.");
             }
@@ -220,6 +222,16 @@ data_type_conversion(const DataSet& src, const std::optional<int64_t> start = st
         }
         const size_t* lims_data_const = lims_data.release();
         des->Set(knowhere::meta::EMB_LIST_OFFSET, lims_data_const);
+        des->Set(knowhere::meta::EMB_LIST_COUNT, static_cast<int64_t>(lims_size));
+        des->Set(knowhere::meta::NQ, static_cast<int64_t>(lims_size));
+    }
+
+    // The OOD query-training sample is always fp32 and is not owned by the DataSet, so it is forwarded as-is
+    // rather than converted alongside the tensor. See knowhere::meta::TRAIN_QUERY_TENSOR.
+    auto train_queries = src.Get<const float*>(knowhere::meta::TRAIN_QUERY_TENSOR);
+    if (train_queries != nullptr) {
+        des->Set(knowhere::meta::TRAIN_QUERY_TENSOR, train_queries);
+        des->Set(knowhere::meta::TRAIN_QUERY_ROWS, src.Get<int64_t>(knowhere::meta::TRAIN_QUERY_ROWS));
     }
     return des;
 }

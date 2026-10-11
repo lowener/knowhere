@@ -35,32 +35,82 @@ LoadConfig(Config* cfg, const Json& json, knowhere::PARAM_TYPE param_type, const
 
 template <typename T>
 inline expected<DataSetPtr>
-Cluster<T>::Train(const DataSet& dataset, const Json& json) {
-    auto cfg = this->node->CreateConfig();
-    std::string msg;
-    auto status = LoadConfig(cfg.get(), json, knowhere::CLUSTER, "Train", &msg);
-    if (status != Status::success) {
-        return expected<DataSetPtr>::Err(status, msg);
-    }
-    return this->node->Train(dataset, *cfg);
+Cluster<T>::Train(const DataSet& dataset, const Json& json) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        auto cfg = this->node->CreateConfig();
+        std::string msg;
+        auto status = LoadConfig(cfg.get(), json, knowhere::CLUSTER, "Train", &msg);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, msg);
+        }
+        return this->node->Train(dataset, *cfg);
+    });
 }
 
 template <typename T>
 inline expected<DataSetPtr>
-Cluster<T>::Assign(const DataSet& dataset) {
-    return this->node->Assign(dataset);
+Cluster<T>::Assign(const DataSet& dataset) noexcept {
+    return GuardedCall([&]() { return this->node->Assign(dataset); });
 }
 
 template <typename T>
 inline expected<DataSetPtr>
-Cluster<T>::GetCentroids() const {
-    return this->node->GetCentroids();
+Cluster<T>::Assign(const DataSet& dataset, const Json& json) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        auto cfg = this->node->CreateConfig();
+        std::string msg;
+        auto status = LoadConfig(cfg.get(), json, knowhere::CLUSTER, "Assign", &msg);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, msg);
+        }
+        return this->node->Assign(dataset, *cfg);
+    });
+}
+
+template <typename T>
+inline expected<DataSetPtr>
+Cluster<T>::AssignWithDistance(const DataSet& dataset, const Json& json) noexcept {
+    return GuardedCall([&]() -> expected<DataSetPtr> {
+        auto cfg = this->node->CreateConfig();
+        std::string msg;
+        auto status = LoadConfig(cfg.get(), json, knowhere::CLUSTER, "AssignWithDistance", &msg);
+        if (status != Status::success) {
+            return expected<DataSetPtr>::Err(status, msg);
+        }
+        return this->node->AssignWithDistance(dataset, *cfg);
+    });
+}
+
+template <typename T>
+inline expected<CompactionResult>
+Cluster<T>::BuildCompactionPlan(const std::vector<uint64_t>& centroid_counts, const Json& json) noexcept {
+    return GuardedCall([&]() -> expected<CompactionResult> {
+        auto cfg = this->node->CreateConfig();
+        std::string msg;
+        auto status = LoadConfig(cfg.get(), json, knowhere::CLUSTER, "BuildCompactionPlan", &msg);
+        if (status != Status::success) {
+            return expected<CompactionResult>::Err(status, msg);
+        }
+        return this->node->BuildCompactionPlan(centroid_counts, *cfg);
+    });
+}
+
+template <typename T>
+inline expected<DataSetPtr>
+Cluster<T>::GetCentroids() const noexcept {
+    return GuardedCall([&]() { return this->node->GetCentroids(); });
+}
+
+template <typename T>
+inline Status
+Cluster<T>::SetCentroids(const DataSet& centroids) noexcept {
+    return GuardedCall([&]() { return this->node->SetCentroids(centroids); });
 }
 
 template <typename T>
 inline std::string
-Cluster<T>::Type() const {
-    return this->node->Type();
+Cluster<T>::Type() const noexcept {
+    return GuardedCall([&]() { return this->node->Type(); });
 }
 
 template class Cluster<ClusterNode>;

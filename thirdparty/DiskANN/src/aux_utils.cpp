@@ -20,6 +20,7 @@
 #include "diskann/aux_utils.h"
 #include "diskann/cached_io.h"
 #include "diskann/index.h"
+#include "diskann/nvtx_helper.h"
 #include "diskann/partition_and_pq.h"
 #include "diskann/percentile_stats.h"
 #include "diskann/pq_flash_index.h"
@@ -304,6 +305,7 @@ namespace diskann {
                    const std::string &idmaps_suffix, const _u64 nshards,
                    unsigned max_degree, const std::string &output_vamana,
                    const std::string &medoids_file) {
+    DISKANN_NVTX_RANGE("merge_shards");
     // Read ID maps
     std::vector<std::string>           vamana_names(nshards);
     std::vector<std::vector<unsigned>> idmaps(nshards);
@@ -485,6 +487,7 @@ namespace diskann {
       unsigned L, unsigned R, bool accelerate_build, bool shuffle_build, double sampling_rate,
       double ram_budget, std::string mem_index_path, std::string medoids_file,
       std::string centroids_file) {
+    DISKANN_NVTX_RANGE("build_merged_vamana_index");
     size_t base_num, base_dim;
     uint32_t shard_r = 2*R/3;
     diskann::get_bin_metadata(base_file, base_num, base_dim);
@@ -684,6 +687,7 @@ namespace diskann {
       const std::string &pq_compressed_code_path, const unsigned entry_point,
       const std::vector<std::vector<unsigned>> &graph,
       const std::string                        &cache_file) {
+    DISKANN_NVTX_RANGE("generate_cache_list_from_graph_with_pq");
     if (num_nodes_to_cache <= 0) {
       LOG_KNOWHERE_INFO_
           << "The number of cache nodes <= 0, no need to generate cache files";
@@ -864,6 +868,7 @@ namespace diskann {
       std::unique_ptr<diskann::PQFlashIndex<T>> &pFlashIndex, T *tuning_sample,
       _u64 tuning_sample_num, _u64 tuning_sample_aligned_dim, uint32_t L,
       uint32_t nthreads, uint32_t start_bw) {
+    DISKANN_NVTX_RANGE("optimize_beamwidth");
     uint32_t cur_bw = start_bw;
     double   max_qps = 0;
     uint32_t best_bw = start_bw;
@@ -920,6 +925,7 @@ namespace diskann {
                           const std::string mem_index_file,
                           const std::string output_file,
                           const std::string reorder_data_file) {
+    DISKANN_NVTX_RANGE("create_disk_layout");
     unsigned npts, ndims;
 
     // amount to read or write in one shot
@@ -1260,6 +1266,7 @@ void create_aisaq_layout(const std::string base_file, const std::string mem_inde
                         int inline_pq /* control num of inline pq: -1=none, 0=auto, others: num of pq vectors <= R */,
                         bool &rearrange /* enable vectors rearangement */)
 {
+    DISKANN_NVTX_RANGE("create_aisaq_layout");
     uint32_t npts, ndims;
 
     // amount to read or write in one shot
@@ -1609,6 +1616,7 @@ void create_aisaq_layout(const std::string base_file, const std::string mem_inde
 
 template<typename T>
   int build_disk_index(BuildConfig &config) {
+    DISKANN_NVTX_RANGE("build_disk_index");
     if (!knowhere::KnowhereFloatTypeCheck<T>::value &&
         (config.compare_metric == diskann::Metric::INNER_PRODUCT ||
          config.compare_metric == diskann::Metric::COSINE)) {

@@ -37,16 +37,99 @@
 #include <cuvs/cluster/kmeans.hpp>
 #include <cuvs/neighbors/vamana.hpp>
 #include "diskann/diskann_gpu.h"
+#include "diskann/nvtx_helper.h"
+#include "diskann/utils.h"
 #include "knowhere/log.h"
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <raft/core/resources.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <cuvs/neighbors/brute_force.hpp>
+#include <cuvs/preprocessing/quantize/pq.hpp>
+
+// same as gen_random_slice, but use pinned memory for the sampled data
+template<typename T>
+void gen_random_slice_gpu(const std::string data_file, double p_val,
+        std::unique_ptr<raft::pinned_matrix<float, int64_t>>& sampled_data,
+        size_t &slice_size, size_t &ndims,
+        std::vector<uint32_t> *sampled_ids) {
+  DISKANN_NVTX_RANGE("gen_random_slice_gpu(file)");
+  auto const& res = raft::device_resources_manager::get_device_resources();
+  size_t   npts;
+  uint32_t npts32, ndims32;
+
+  // amount to read in one shot
+  _u64 read_blk_size = 64 * 1024 * 1024;
+  // create cached reader + writer
+  cached_ifstream base_reader(data_file.c_str(), read_blk_size);
+
+  // metadata: npts, ndims
+  base_reader.read((char *) &npts32, sizeof(unsigned));
+  base_reader.read((char *) &ndims32, sizeof(unsigned));
+  npts = npts32;
+  ndims = ndims32;
+
+  std::unique_ptr<T[]> cur_vector_T = std::make_unique<T[]>(ndims);
+  p_val = p_val < 1 ? p_val : 1;
+
+  std::random_device rd;  // Will be used to obtain a seed for the random number
+  size_t             x = rd();
+  std::mt19937       generator((unsigned) x);
+  std::uniform_real_distribution<float> distribution(0, 1);
+  std::vector<bool> selected(npts, false);
+  slice_size = 0;
+
+  for (size_t i = 0; i < npts; i++) {
+    float rnd_val = distribution(generator);
+    if (rnd_val < p_val) {
+      selected[i] = true;
+      slice_size++;
+      if (sampled_ids) {
+        sampled_ids->push_back(i);
+      }
+    }
+  }
+  
+  sampled_data = std::make_unique<raft::pinned_matrix<float, int64_t>>(raft::make_pinned_matrix<float, int64_t>(res, slice_size, ndims));
+  auto sampled_data_ptr = sampled_data->data_handle();
+  size_t sampled_index = 0;
+  for (size_t i = 0; i < npts; i++) {
+    base_reader.read((char *) cur_vector_T.get(), ndims * sizeof(T));
+    if (selected[i]) {
+      for (size_t d = 0; d < ndims; d++) {
+        sampled_data_ptr[sampled_index * ndims + d] = float(cur_vector_T[d]);
+      }
+      sampled_index++;
+    }
+  }
+}
+
+template void gen_random_slice_gpu<int8_t>(const std::string data_file, double p_val,
+	std::unique_ptr<raft::pinned_matrix<float, int64_t>>& sampled_data,
+	size_t &slice_size, size_t &ndims,
+	std::vector<uint32_t> *sampled_ids);
+template void gen_random_slice_gpu<uint8_t>(const std::string data_file, double p_val,
+	std::unique_ptr<raft::pinned_matrix<float, int64_t>>& sampled_data,
+	size_t &slice_size, size_t &ndims,
+	std::vector<uint32_t> *sampled_ids);
+template void gen_random_slice_gpu<float>(const std::string data_file, double p_val,
+	std::unique_ptr<raft::pinned_matrix<float, int64_t>>& sampled_data,
+	size_t &slice_size, size_t &ndims,
+	std::vector<uint32_t> *sampled_ids);
+template void gen_random_slice_gpu<knowhere::fp16>(const std::string data_file, double p_val,
+	std::unique_ptr<raft::pinned_matrix<float, int64_t>>& sampled_data,
+	size_t &slice_size, size_t &ndims,
+	std::vector<uint32_t> *sampled_ids);
+template void gen_random_slice_gpu<knowhere::bf16>(const std::string data_file, double p_val,
+	std::unique_ptr<raft::pinned_matrix<float, int64_t>>& sampled_data,
+	size_t &slice_size, size_t &ndims,
+	std::vector<uint32_t> *sampled_ids);
 
 template<typename T, typename idxT>
 raft::device_matrix<T, idxT> read_bin_dataset(
 		const raft::device_resources &dev_resources, const std::string &fname) {
+	DISKANN_NVTX_RANGE("read_bin_dataset");
 	// Open file
 	std::ifstream datafile(fname, std::ios::binary);
 	if (!datafile) {
@@ -97,6 +180,9 @@ void vamana_build_and_write(raft::device_resources const &dev_resources,
 		raft::device_matrix_view<const T, int64_t> dataset,
 		std::string out_fname, int degree, int visited_size, float max_fraction,
 		int iters) {
+	std::stringstream ss;
+	ss << "vamana_build_and_write(rows: " << dataset.extent(0) << ", cols: " << dataset.extent(1) << ")";
+	DISKANN_NVTX_RANGE(ss.str());
 	using namespace cuvs::neighbors;
 
 	// use default index parameters
@@ -126,6 +212,9 @@ void vamana_build_and_write(raft::device_resources const &dev_resources,
 void kmeans_gpu_device_data(const raft::resources &dev_resources, const float *d_chunk_data,
 		size_t num_train, size_t dim, size_t num_centers, int max_iter,
 		float *d_centroids_out, bool is_balanced/*=false*/) {
+	std::stringstream ss;
+	ss << "kmeans_gpu_device_data(num_train: " << num_train << ", dim: " << dim << ", num_centers: " << num_centers << ", max_iter: " << max_iter << ", is_balanced: " << is_balanced << ")";
+	DISKANN_NVTX_RANGE(ss.str());
 	// KMeans parameters
 	cuvs::cluster::kmeans::params km_params;
 	int64_t n_iter;
@@ -155,6 +244,9 @@ void kmeans_gpu_device_data(const raft::resources &dev_resources, const float *d
 void kmeans_gpu(const raft::resources &dev_resources, const float *h_chunk_data,
 		size_t num_train, size_t dim, size_t num_centers, int max_iter,
 		float *h_centroids_out, bool is_balanced/*=false*/) {
+	std::stringstream ss;
+	ss << "kmeans_gpu(num_train: " << num_train << ", dim: " << dim << ", num_centers: " << num_centers << ", max_iter: " << max_iter << ", is_balanced: " << is_balanced << ")";
+	DISKANN_NVTX_RANGE(ss.str());
 
 	// Allocate device matrices
 	auto d_data = raft::make_device_matrix<float, int64_t>(dev_resources, num_train, dim);
@@ -171,6 +263,7 @@ void kmeans_gpu(const raft::resources &dev_resources, const float *h_chunk_data,
 void kmeans_medoids_gpu(const raft::resources &dev_resources, const float *h_chunk_data,
 		size_t num_train, size_t dim, size_t num_centers, int max_iter,
 		float *h_centroids_out, bool is_balanced, uint32_t* h_medoids) {
+	DISKANN_NVTX_RANGE("kmeans_medoids_gpu");
 
 	// Allocate device matrices
 	auto d_data = raft::make_device_matrix<float, int64_t>(dev_resources, num_train, dim);
@@ -207,6 +300,7 @@ int predict_gpu(const raft::resources& handle,
                 const float* h_centroids,
                 size_t n_clusters,
                 int* h_labels) {
+    DISKANN_NVTX_RANGE("predict_gpu");
     if (!is_gpu_available()) return -1;
 
     // Allocate device buffers
@@ -256,6 +350,7 @@ bool is_gpu_available() {
 
 void gpu_get_mem_info(const raft::resources &dev_resources, size_t &gpu_free_mem,
 		size_t &gpu_total_mem) {
+    DISKANN_NVTX_RANGE("gpu_get_mem_info");
     int dev = raft::resource::get_device_id(dev_resources);
 
     int prev_dev;
@@ -273,6 +368,7 @@ template<typename T>
 int brute_force_gpu(const raft::resources &dev_resources, const T *h_data,
 		size_t n_samples, size_t dim, size_t k, const T *queries,
 		size_t n_queries, int64_t *h_labels) {
+	DISKANN_NVTX_RANGE("brute_force_gpu");
 	using namespace cuvs::neighbors;
 
 	brute_force::index_params index_params;
@@ -299,6 +395,101 @@ int brute_force_gpu(const raft::resources &dev_resources, const T *h_data,
 			raft::resource::get_cuda_stream(dev_resources));
 	return 0;
 
+}
+
+std::unique_ptr<cuvs::preprocessing::quantize::pq::quantizer<float>>
+initialize_pq_quantizer_gpu(const raft::resources& dev_resources,
+                            const float* h_centroid,
+                            const float* h_full_pivot_data,
+                            size_t dim,
+                            size_t num_centers,
+                            size_t num_pq_chunks) {
+    DISKANN_NVTX_RANGE("initialize_pq_quantizer_gpu");
+    if (num_centers != 256 || num_pq_chunks == 0 || (dim % num_pq_chunks != 0)) {
+        return nullptr;
+    }
+
+    const uint32_t subspace_dim = static_cast<uint32_t>(dim / num_pq_chunks);
+    auto d_vq_code_book =
+        raft::make_device_matrix<float, uint32_t>(dev_resources, 1, static_cast<uint32_t>(dim));
+    auto d_pq_code_book = raft::make_device_matrix<float, uint32_t>(
+        dev_resources, static_cast<uint32_t>(num_centers * num_pq_chunks), subspace_dim);
+    auto d_empty = raft::make_device_matrix<uint8_t, int64_t>(dev_resources, 0, 0);
+
+    // DiskANN stores pivots as [center][dim]. cuVS expects subspace-major layout:
+    // [chunk * num_centers + center][subspace_dim].
+    std::vector<float> pq_code_book_subspace_major(num_centers * dim);
+    for (size_t chunk = 0; chunk < num_pq_chunks; chunk++) {
+        for (size_t center = 0; center < num_centers; center++) {
+            for (size_t k = 0; k < subspace_dim; k++) {
+                pq_code_book_subspace_major[(chunk * num_centers + center) * subspace_dim + k] =
+                    h_full_pivot_data[center * dim + chunk * subspace_dim + k];
+            }
+        }
+    }
+
+    auto stream = raft::resource::get_cuda_stream(dev_resources);
+    raft::copy(d_vq_code_book.data_handle(), h_centroid, dim, stream);
+    raft::copy(d_pq_code_book.data_handle(), pq_code_book_subspace_major.data(), num_centers * dim, stream);
+    raft::resource::sync_stream(dev_resources);
+
+    cuvs::cluster::kmeans::params km_params;
+    km_params.n_clusters = static_cast<int>(num_centers);
+    km_params.max_iter = 1;
+    km_params.n_init = 1;
+    auto pq_params = cuvs::preprocessing::quantize::pq::params(
+        8, static_cast<uint32_t>(num_pq_chunks), true, true, 1,
+        cuvs::preprocessing::quantize::pq::kmeans_params_variant(km_params));
+
+    return std::make_unique<cuvs::preprocessing::quantize::pq::quantizer<float>>(
+        cuvs::preprocessing::quantize::pq::quantizer<float>{
+            pq_params, cuvs::neighbors::vpq_dataset<float, int64_t>(
+                           std::move(d_vq_code_book), std::move(d_pq_code_book), std::move(d_empty))});
+}
+
+void transform_pq_gpu(const raft::resources& dev_resources,
+                      const cuvs::preprocessing::quantize::pq::quantizer<float>& pq_quantizer,
+                      const float* h_block_data,
+                      size_t cur_blk_size,
+                      size_t dim,
+                      size_t num_pq_chunks,
+                      float* d_block_data,
+                      uint8_t* d_compressed_data_block,
+                      uint8_t* h_codes_out,
+                      float* h_inflated_out /*=nullptr*/) {
+    DISKANN_NVTX_RANGE("transform_pq_gpu");
+    auto stream = raft::resource::get_cuda_stream(dev_resources);
+
+    // No explicit mean-centering here: pq::transform subtracts the single VQ center
+    // (the DiskANN centroid) from every vector before encoding.
+    raft::copy(d_block_data, h_block_data, cur_blk_size * dim, stream);
+
+    auto d_block_data_view = raft::make_device_matrix_view<const float, int64_t>(
+        d_block_data, static_cast<int64_t>(cur_blk_size), static_cast<int64_t>(dim));
+    auto d_compressed_data_block_view = raft::make_device_matrix_view<uint8_t, int64_t>(
+        d_compressed_data_block, static_cast<int64_t>(cur_blk_size), static_cast<int64_t>(num_pq_chunks));
+    cuvs::preprocessing::quantize::pq::transform(
+        dev_resources, pq_quantizer, d_block_data_view, d_compressed_data_block_view);
+
+    raft::copy(h_codes_out, d_compressed_data_block, cur_blk_size * num_pq_chunks, stream);
+    if (h_inflated_out != nullptr) {
+        auto d_inflated_data_block = raft::make_device_matrix<float, int64_t>(
+            dev_resources, static_cast<int64_t>(cur_blk_size), static_cast<int64_t>(dim));
+        auto d_centroid_labels = raft::make_device_vector<uint32_t, int64_t>(
+            dev_resources, static_cast<int64_t>(cur_blk_size));
+        RAFT_CUDA_TRY(cudaMemsetAsync(d_centroid_labels.data_handle(),
+                                      0,
+                                      cur_blk_size * sizeof(uint32_t),
+                                      stream));
+        cuvs::preprocessing::quantize::pq::inverse_transform(
+            dev_resources,
+            pq_quantizer,
+            raft::make_const_mdspan(d_compressed_data_block_view),
+            d_inflated_data_block.view(),
+            std::make_optional(raft::make_const_mdspan(d_centroid_labels.view())));
+        raft::copy(h_inflated_out, d_inflated_data_block.data_handle(), cur_blk_size * dim, stream);
+    }
+    raft::resource::sync_stream(dev_resources);
 }
 
 template raft::device_matrix<float, int64_t> read_bin_dataset<float,

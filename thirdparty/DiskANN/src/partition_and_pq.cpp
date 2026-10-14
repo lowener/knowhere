@@ -44,10 +44,12 @@
 #include "diskann/memory_mapper.h"
 #include "diskann/partition_and_pq.h"
 #ifdef KNOWHERE_WITH_CUVS
+#include <raft/core/host_mdarray.hpp>
 #include "diskann/diskann_gpu.h"
 #endif
 
 #include "diskann/maybe_vector.h"
+#include "diskann/nvtx_helper.h"
 
 // block size for reading/ processing large files and matrices in blocks
 #define BLOCK_SIZE 1000000
@@ -58,6 +60,7 @@ constexpr uint32_t kNumOfIterations = 10;
 template<typename T>
 void gen_random_slice(const std::string base_file,
                       const std::string output_file, double sampling_rate) {
+  DISKANN_NVTX_RANGE("gen_random_slice(file->file)");
   _u64            read_blk_size = 64 * 1024 * 1024;
   cached_ifstream base_reader(base_file.c_str(), read_blk_size);
   std::ofstream   sample_writer(output_file.c_str(), std::ios::binary);
@@ -113,6 +116,7 @@ void gen_random_slice(const std::string data_file, double p_val,
                       std::unique_ptr<float[]>& sampled_data,
                       size_t &slice_size, size_t &ndims,
                       std::vector<uint32_t> *sampled_ids) {
+  DISKANN_NVTX_RANGE("gen_random_slice(file)");
   size_t                          npts;
   uint32_t                        npts32, ndims32;
   std::vector<std::vector<float>> sampled_vectors;
@@ -163,6 +167,7 @@ void gen_random_slice(const std::string data_file, double p_val,
 template<typename T>
 void gen_random_slice(const T *inputdata, size_t npts, size_t ndims,
                       double p_val, std::unique_ptr<float[]> &sampled_data, size_t &slice_size) {
+  DISKANN_NVTX_RANGE("gen_random_slice(matrix)");
   std::vector<std::vector<float>> sampled_vectors;
   const T                        *cur_vector_T;
 
@@ -203,6 +208,7 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
                        unsigned dim, unsigned num_centers,
                        unsigned num_pq_chunks, unsigned max_k_means_reps,
                        std::string pq_pivots_path, bool make_zero_mean) {
+  DISKANN_NVTX_RANGE("generate_pq_pivots");
   if (num_pq_chunks > dim) {
     LOG(ERROR) << " Error: number of chunks more than dimension";
     return -1;
@@ -210,9 +216,13 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
 
   bool use_gpu = false;
 #ifdef KNOWHERE_WITH_CUVS
-  auto const& res = raft::device_resources_manager::get_device_resources();
   if (is_gpu_available()) {
-    use_gpu = true;
+    // cuVS kmeans crashes when num_centers > num_train, fall back to CPU
+    if (num_train < num_centers) {
+      LOG_KNOWHERE_INFO_ << "num_centers(" << num_centers << ") > num_train(" << num_train << "), switching to CPU";
+    } else {
+      use_gpu = true;
+    }
   }
 #endif
   std::unique_ptr<float[]> train_data;
@@ -322,65 +332,77 @@ int generate_pq_pivots(const float *passed_train_data, size_t num_train,
 
   full_pivot_data.reset(new float[num_centers * dim]);
 
-  bool used_gpu = false;
 #ifdef KNOWHERE_WITH_CUVS
-  // GPU path
-  if(is_gpu_available()) {
-    // cuVS kmeans crashes when num_centers > num_train, fall back to CPU
-    if (num_train < num_centers) {
-      LOG_KNOWHERE_INFO_ << "num_centers(" << num_centers << ") > num_train(" << num_train << "), switching to CPU";
-    } else {
-      // In case of a perfect split of pq chunks, run cuvs::pq. Otherwise use cuvs::kmeans on the chunks
-      // cuvs pq when used with a vq_centers=1 will do the mean center
-      if (dim % num_pq_chunks == 0) {
-        LOG_KNOWHERE_INFO_ << "Running pq with " << num_centers << " clusters, pq "<< num_pq_chunks<< " ...using cuvs::pq!";
-        using kmeans_params_variant = cuvs::preprocessing::quantize::pq::kmeans_params_variant;
-        cuvs::cluster::kmeans::params km_params;
-        km_params.max_iter = max_k_means_reps;
-        km_params.n_init = 1;
-        km_params.n_clusters = num_centers;
+  // The rearrangement computed above is always the identity (bins are filled in
+  // dimension order), so the GPU paths can slice chunks straight out of passed_train_data.
+  if (use_gpu) {
+    auto const& res = raft::device_resources_manager::get_device_resources();
+    auto stream = raft::resource::get_cuda_stream(res);
+    // In case of a perfect split of pq chunks, run cuvs::pq. Otherwise use cuvs::kmeans on the chunks
+    // cuvs pq when used with a vq_centers=1 will do the mean center
+    if (dim % num_pq_chunks == 0 && num_centers == 256) {
+      LOG_KNOWHERE_INFO_ << "Running pq with " << num_centers << " clusters, pq "<< num_pq_chunks<< " ...using cuvs::pq!";
+      using kmeans_params_variant = cuvs::preprocessing::quantize::pq::kmeans_params_variant;
+      cuvs::cluster::kmeans::params km_params;
+      km_params.max_iter = max_k_means_reps;
+      km_params.n_init = 1;
+      km_params.n_clusters = num_centers;
 
-        cuvs::preprocessing::quantize::pq::params params(8, num_pq_chunks, true, make_zero_mean, 1, kmeans_params_variant(km_params), 1000, num_train);
-        auto train_data_view = raft::make_host_matrix_view<const float, int64_t>(passed_train_data, num_train, dim);
-        auto pq_quantizer = cuvs::preprocessing::quantize::pq::build(res, params, train_data_view);
-        raft::copy(full_pivot_data.get(), pq_quantizer.vpq_codebooks.pq_code_book.data_handle(), num_centers * dim, raft::resource::get_cuda_stream(res));
-        raft::copy(centroid.get(), pq_quantizer.vpq_codebooks.vq_code_book.data_handle(), dim, raft::resource::get_cuda_stream(res));
-        raft::resource::sync_stream(res);
-        used_gpu = true;
-      } else {
-        LOG_KNOWHERE_INFO_ << "Running pq with " << num_centers << " clusters, pq "<< num_pq_chunks<< " ...using cuvs::kmeans!";
-        // Allocate once memory with maximum chunk size
-        auto cur_pivot_data = raft::make_device_matrix<float, int64_t>(res, num_centers, high_val);
-        auto cur_data = raft::make_device_matrix<float, int64_t>(res, num_train, high_val);
-        auto d_centroid = raft::make_device_vector<float, int64_t>(res, dim);
+      cuvs::preprocessing::quantize::pq::params params(8, num_pq_chunks, true, make_zero_mean, 1, kmeans_params_variant(km_params), 1000, num_train);
+      auto train_data_view = raft::make_host_matrix_view<const float, int64_t>(passed_train_data, num_train, dim);
+      auto pq_quantizer = cuvs::preprocessing::quantize::pq::build(res, params, train_data_view);
 
-        for (size_t i = 0; i < num_pq_chunks; i++) {
-          size_t cur_chunk_size = chunk_offsets[i + 1] - chunk_offsets[i];
-          if (cur_chunk_size == 0)
-            continue;
-          
-          raft::copy_matrix<float>(cur_data.data_handle(), cur_chunk_size, passed_train_data + chunk_offsets[i],
-                            dim, cur_chunk_size, num_train, raft::resource::get_cuda_stream(res));
-          
-          if (make_zero_mean) {
-            mean_center_gpu(res, cur_data.data_handle(), num_train, cur_chunk_size, d_centroid.data_handle() + chunk_offsets[i]);
-          }
-          kmeans_gpu_device_data(res, cur_data.data_handle(), num_train, cur_chunk_size,
-                  num_centers, max_k_means_reps, cur_pivot_data.data_handle());
-          
-          raft::copy_matrix<float>(full_pivot_data.get() + chunk_offsets[i], dim, cur_pivot_data.data_handle(),
-                            cur_chunk_size, cur_chunk_size, num_centers,
-                            raft::resource::get_cuda_stream(res));
-        }
-        raft::copy(centroid.get(), d_centroid.data_handle(), dim, raft::resource::get_cuda_stream(res));
-        raft::resource::sync_stream(res);
-        used_gpu = true;
+      // cuVS stores the codebook chunk-major ([chunk * num_centers + center][chunk_dim]),
+      // DiskANN pivots are center-major ([center][dim]).
+      const size_t chunk_dim = dim / num_pq_chunks;
+      std::vector<float> pq_code_book(num_centers * dim);
+      raft::copy(pq_code_book.data(), pq_quantizer.vpq_codebooks.pq_code_book.data_handle(), num_centers * dim, stream);
+      // Without VQ the codebook is empty and the centroid stays zero.
+      if (make_zero_mean) {
+        raft::copy(centroid.get(), pq_quantizer.vpq_codebooks.vq_code_book.data_handle(), dim, stream);
       }
+      raft::resource::sync_stream(res);
+      for (size_t chunk = 0; chunk < num_pq_chunks; chunk++) {
+        for (size_t center = 0; center < num_centers; center++) {
+          std::memcpy(full_pivot_data.get() + center * dim + chunk * chunk_dim,
+                      pq_code_book.data() + (chunk * num_centers + center) * chunk_dim,
+                      chunk_dim * sizeof(float));
+        }
+      }
+    } else {
+      LOG_KNOWHERE_INFO_ << "Running pq with " << num_centers << " clusters, pq "<< num_pq_chunks<< " ...using cuvs::kmeans!";
+      // Allocate once memory with maximum chunk size
+      auto cur_pivot_data = raft::make_device_matrix<float, int64_t>(res, num_centers, high_val);
+      auto cur_data = raft::make_device_matrix<float, int64_t>(res, num_train, high_val);
+      auto d_centroid = raft::make_device_vector<float, int64_t>(res, dim);
+
+      for (size_t i = 0; i < num_pq_chunks; i++) {
+        size_t cur_chunk_size = chunk_offsets[i + 1] - chunk_offsets[i];
+        if (cur_chunk_size == 0)
+          continue;
+
+        raft::copy_matrix<float>(cur_data.data_handle(), cur_chunk_size, passed_train_data + chunk_offsets[i],
+                          dim, cur_chunk_size, num_train, stream);
+
+        if (make_zero_mean) {
+          mean_center_gpu(res, cur_data.data_handle(), num_train, cur_chunk_size, d_centroid.data_handle() + chunk_offsets[i], true);
+        }
+        kmeans_gpu_device_data(res, cur_data.data_handle(), num_train, cur_chunk_size,
+                num_centers, max_k_means_reps, cur_pivot_data.data_handle());
+
+        raft::copy_matrix<float>(full_pivot_data.get() + chunk_offsets[i], dim, cur_pivot_data.data_handle(),
+                          cur_chunk_size, cur_chunk_size, num_centers, stream);
+      }
+      // d_centroid is only written when mean-centering; otherwise the centroid stays zero.
+      if (make_zero_mean) {
+        raft::copy(centroid.get(), d_centroid.data_handle(), dim, stream);
+      }
+      raft::resource::sync_stream(res);
     }
   }
 #endif
 
-  if(!used_gpu) {
+  if(!use_gpu) {
     std::atomic<uint32_t> num_chunk_done(0);
     const uint32_t        num_chunk_step = num_pq_chunks / COMPLETION_PERCENT;
     auto thread_pool = knowhere::ThreadPool::GetGlobalBuildThreadPool();
@@ -458,6 +480,7 @@ int generate_pq_data_from_pivots(const std::string data_file,
                                  unsigned num_centers, unsigned num_pq_chunks,
                                  std::string pq_pivots_path,
                                  std::string pq_compressed_vectors_path) {
+  DISKANN_NVTX_RANGE("generate_pq_data_from_pivots");
   _u64            read_blk_size = 64 * 1024 * 1024;
   cached_ifstream base_reader(data_file, read_blk_size);
   _u32            npts32;
@@ -543,6 +566,7 @@ int generate_pq_data_from_pivots(const std::string data_file,
   compressed_file_writer.write((char *) &num_pq_chunks_u32, sizeof(uint32_t));
 
   size_t block_size = num_points <= BLOCK_SIZE ? num_points : BLOCK_SIZE;
+  size_t num_blocks = DIV_ROUND_UP(num_points, block_size);
 
 #ifdef SAVE_INFLATED_PQ
   std::ofstream inflated_file_writer(inflated_pq_file, std::ios::binary);
@@ -560,10 +584,44 @@ int generate_pq_data_from_pivots(const std::string data_file,
               block_size * (_u64) num_pq_chunks * sizeof(uint32_t));
 
   std::unique_ptr<T[]> block_data_T = std::make_unique<T[]>(block_size * dim);
-  std::unique_ptr<float[]> block_data_float =
-      std::make_unique<float[]>(block_size * dim);
+  std::unique_ptr<float[]> block_data_float;
+  float* block_data_float_ptr = nullptr;
 
-  size_t num_blocks = DIV_ROUND_UP(num_points, block_size);
+  bool predicted_with_gpu = false;
+  bool use_gpu = false;
+  bool rearrengement_is_identity = true;
+  for (uint64_t i = 0; i < dim; i++) {
+    if (rearrangement[i] != i) {
+      rearrengement_is_identity = false;
+      break;
+    }
+  }
+#if defined(KNOWHERE_WITH_CUVS)
+  auto const& res = raft::device_resources_manager::get_device_resources();
+  std::unique_ptr<cuvs::preprocessing::quantize::pq::quantizer<float>> pq_quantizer_ptr;
+  std::unique_ptr<raft::pinned_matrix<float, int64_t>> pinned_block_data_float;
+  std::unique_ptr<raft::device_matrix<float, int64_t>> d_block_data_float;
+  std::unique_ptr<raft::device_matrix<uint8_t, int64_t>> d_compressed_data_block;
+  if (is_gpu_available() && rearrengement_is_identity && num_centers <= 256 &&
+      (dim % num_pq_chunks == 0)) {
+    pq_quantizer_ptr = initialize_pq_quantizer_gpu(
+        res, centroid.get(), full_pivot_data.get(), dim, num_centers, num_pq_chunks);
+    if (pq_quantizer_ptr != nullptr) {
+      pinned_block_data_float = std::make_unique<raft::pinned_matrix<float, int64_t>>(
+          raft::make_pinned_matrix<float, int64_t>(res, block_size, dim));
+      block_data_float_ptr = pinned_block_data_float->data_handle();
+      d_block_data_float = std::make_unique<raft::device_matrix<float, int64_t>>(
+          raft::make_device_matrix<float, int64_t>(res, block_size, dim));
+      d_compressed_data_block = std::make_unique<raft::device_matrix<uint8_t, int64_t>>(
+          raft::make_device_matrix<uint8_t, int64_t>(res, block_size, num_pq_chunks));
+      use_gpu = true;
+    }
+  }
+#endif
+  if (!use_gpu) {
+    block_data_float = std::make_unique<float[]>(block_size * dim);
+    block_data_float_ptr = block_data_float.get();
+  }
   auto   thread_pool = knowhere::ThreadPool::GetGlobalBuildThreadPool();
   std::vector<folly::Future<folly::Unit>> futures;
   futures.reserve(num_pq_chunks);
@@ -572,105 +630,125 @@ int generate_pq_data_from_pivots(const std::string data_file,
     size_t start_id = block * block_size;
     size_t end_id = (std::min)((block + 1) * block_size, num_points);
     size_t cur_blk_size = end_id - start_id;
+    predicted_with_gpu = false;
 
-    base_reader.read((char *) (block_data_T.get()),
-                     sizeof(T) * (cur_blk_size * dim));
-    diskann::convert_types<T, float>(block_data_T.get(), block_data_float.get(),
-                                     cur_blk_size, dim);
+    {
+      DISKANN_NVTX_RANGE("read_block_data");
+      base_reader.read((char *) (block_data_T.get()),
+                       sizeof(T) * (cur_blk_size * dim));
+      diskann::convert_types<T, float>(block_data_T.get(), block_data_float_ptr,
+                                       cur_blk_size, dim);
+    }
+                                     
+    std::unique_ptr<uint8_t[]> pVec;
+    if (num_centers <= 256) {
+      pVec = std::make_unique<uint8_t[]>(cur_blk_size * num_pq_chunks);
+    }
 
     LOG_KNOWHERE_DEBUG_ << "Processing points  [" << start_id << ", " << end_id
                         << ")..";
-    auto num_threads = thread_pool->size();
-    futures.reserve(num_threads);
-    auto batch_size = DIV_ROUND_UP(cur_blk_size, num_threads);
-    for (uint64_t p = 0; p < cur_blk_size; p += batch_size) {
-      futures.emplace_back(thread_pool->push(
-          [&, batch_beg_id = p,
-           batch_end_id = std::min(p + batch_size, cur_blk_size)]() {
-            std::vector<float> block_data_tmp(dim);
-            for (auto index = batch_beg_id; index < batch_end_id; index++) {
-              for (uint64_t d = 0; d < dim; d++) {
-                block_data_float[index * dim + d] -= centroid[d];
-              }
-              for (uint64_t d = 0; d < dim; d++) {
-                block_data_tmp[d] =
-                    block_data_float[index * dim + rearrangement[d]];
-              }
-              for (uint64_t d = 0; d < dim; d++) {
-                block_data_float[index * dim + d] = block_data_tmp[d];
-              }
-            }
-          }));
-    }
-    knowhere::WaitAllSuccess(futures);
-
-    futures.clear();
-    futures.reserve(num_pq_chunks);
-    for (size_t i = 0; i < num_pq_chunks; i++) {
-      size_t cur_chunk_size = chunk_offsets[i + 1] - chunk_offsets[i];
-      if (cur_chunk_size == 0)
-        continue;
-      futures.emplace_back(thread_pool->push([&, chunk_size = cur_chunk_size,
-                                              chunk_index = i]() {
-        std::unique_ptr<float[]> cur_pivot_data =
-            std::make_unique<float[]>(num_centers * chunk_size);
-        std::unique_ptr<float[]> cur_data =
-            std::make_unique<float[]>(cur_blk_size * chunk_size);
-        std::unique_ptr<uint32_t[]> closest_center =
-            std::make_unique<uint32_t[]>(cur_blk_size);
-
-        for (int64_t j = 0; j < (_s64) cur_blk_size; j++) {
-          for (uint64_t k = 0; k < chunk_size; k++)
-            cur_data[j * chunk_size + k] =
-                block_data_float[j * dim + chunk_offsets[chunk_index] + k];
-        }
-
-        for (int64_t j = 0; j < (_s64) num_centers; j++) {
-          std::memcpy(
-              cur_pivot_data.get() + j * chunk_size,
-              full_pivot_data.get() + j * dim + chunk_offsets[chunk_index],
-              chunk_size * sizeof(float));
-        }
-
-        bool predicted_with_gpu=false;
-#if defined(KNOWHERE_WITH_CUVS)
-        if (is_gpu_available()) {
-          auto const& res = raft::device_resources_manager::get_device_resources();
-            predict_gpu(res, cur_data.get(), cur_blk_size, chunk_size,
-                         cur_pivot_data.get(), num_centers,
-                         reinterpret_cast<int*>(closest_center.get()));
-            predicted_with_gpu = true;
-        }
-#endif
-        if(!predicted_with_gpu){
-            math_utils::elkan_L2(cur_data.get(), cur_pivot_data.get(), chunk_size,
-                         cur_blk_size, num_centers, closest_center.get());
-        }
-
-        for (int64_t j = 0; j < (_s64) cur_blk_size; j++) {
-          block_compressed_base[j * num_pq_chunks + chunk_index] =
-              closest_center[j];
+    if (use_gpu) {
+#ifdef KNOWHERE_WITH_CUVS
+      if (pq_quantizer_ptr != nullptr) {
+        transform_pq_gpu(res,
+                         *pq_quantizer_ptr,
+                         block_data_float_ptr,
+                         cur_blk_size,
+                         dim,
+                         num_pq_chunks,
+                         d_block_data_float->data_handle(),
+                         d_compressed_data_block->data_handle(),
+                         pVec.get(),
 #ifdef SAVE_INFLATED_PQ
-          for (uint64_t k = 0; k < chunk_size; k++)
-            block_inflated_base[j * dim + chunk_offsets[chunk_index] + k] =
-                cur_pivot_data[closest_center[j] * chunk_size + k] +
-                centroid[chunk_offsets[chunk_index] + k];
+                         block_inflated_base.get()
+#else
+                         nullptr
 #endif
-        }
-      }));
+        );
+        predicted_with_gpu = true;
+      }
+#endif
     }
-    knowhere::WaitAllSuccess(futures);
-    futures.clear();
+    if (!predicted_with_gpu) {
+      auto num_threads = thread_pool->size();
+      futures.reserve(num_threads);
+      auto batch_size = DIV_ROUND_UP(cur_blk_size, num_threads);
+      for (uint64_t p = 0; p < cur_blk_size; p += batch_size) {
+        futures.emplace_back(thread_pool->push(
+            [&, batch_beg_id = p,
+            batch_end_id = std::min(p + batch_size, cur_blk_size)]() {
+              std::vector<float> block_data_tmp(dim);
+              for (auto index = batch_beg_id; index < batch_end_id; index++) {
+                for (uint64_t d = 0; d < dim; d++) {
+                  block_data_float_ptr[index * dim + d] -= centroid[d];
+                }
+                for (uint64_t d = 0; d < dim; d++) {
+                  block_data_tmp[d] =
+                      block_data_float_ptr[index * dim + rearrangement[d]];
+                }
+                for (uint64_t d = 0; d < dim; d++) {
+                  block_data_float_ptr[index * dim + d] = block_data_tmp[d];
+                }
+              }
+            }));
+      }
+      knowhere::WaitAllSuccess(futures);
+
+      futures.clear();
+      futures.reserve(num_pq_chunks);
+      for (size_t i = 0; i < num_pq_chunks; i++) {
+        size_t cur_chunk_size = chunk_offsets[i + 1] - chunk_offsets[i];
+        if (cur_chunk_size == 0)
+          continue;
+        futures.emplace_back(thread_pool->push([&, chunk_size = cur_chunk_size,
+                                                chunk_index = i]() {
+          std::unique_ptr<float[]> cur_pivot_data =
+              std::make_unique<float[]>(num_centers * chunk_size);
+          std::unique_ptr<float[]> cur_data =
+              std::make_unique<float[]>(cur_blk_size * chunk_size);
+          std::unique_ptr<uint32_t[]> closest_center =
+              std::make_unique<uint32_t[]>(cur_blk_size);
+
+          for (int64_t j = 0; j < (_s64) cur_blk_size; j++) {
+            for (uint64_t k = 0; k < chunk_size; k++)
+              cur_data[j * chunk_size + k] =
+                block_data_float_ptr[j * dim + chunk_offsets[chunk_index] + k];
+          }
+
+          for (int64_t j = 0; j < (_s64) num_centers; j++) {
+            std::memcpy(
+                cur_pivot_data.get() + j * chunk_size,
+                full_pivot_data.get() + j * dim + chunk_offsets[chunk_index],
+                chunk_size * sizeof(float));
+          }
+          math_utils::elkan_L2(cur_data.get(), cur_pivot_data.get(), chunk_size,
+                        cur_blk_size, num_centers, closest_center.get());
+
+          for (int64_t j = 0; j < (_s64) cur_blk_size; j++) {
+            block_compressed_base[j * num_pq_chunks + chunk_index] =
+                closest_center[j];
+  #ifdef SAVE_INFLATED_PQ
+            for (uint64_t k = 0; k < chunk_size; k++)
+              block_inflated_base[j * dim + chunk_offsets[chunk_index] + k] =
+                  cur_pivot_data[closest_center[j] * chunk_size + k] +
+                  centroid[chunk_offsets[chunk_index] + k];
+  #endif
+          }
+        }));
+      }
+      knowhere::WaitAllSuccess(futures);
+      futures.clear();
+      if (num_centers <= 256) {
+        diskann::convert_types<uint32_t, uint8_t>(
+          block_compressed_base.get(), pVec.get(), cur_blk_size, num_pq_chunks);
+      }
+    }
 
     if (num_centers > 256) {
       compressed_file_writer.write(
           (char *) (block_compressed_base.get()),
           cur_blk_size * num_pq_chunks * sizeof(uint32_t));
     } else {
-      std::unique_ptr<uint8_t[]> pVec =
-          std::make_unique<uint8_t[]>(cur_blk_size * num_pq_chunks);
-      diskann::convert_types<uint32_t, uint8_t>(
-          block_compressed_base.get(), pVec.get(), cur_blk_size, num_pq_chunks);
       compressed_file_writer.write(
           (char *) (pVec.get()),
           cur_blk_size * num_pq_chunks * sizeof(uint8_t));
@@ -698,6 +776,7 @@ int estimate_cluster_sizes(float *test_data_float, size_t num_test,
                            const float *pivots, const size_t num_centers,
                            const size_t test_dim, const size_t k_base,
                            std::vector<size_t> &cluster_sizes) {
+  DISKANN_NVTX_RANGE("estimate_cluster_sizes");
 
 	size_t k_candidates = num_centers;
 
@@ -786,6 +865,7 @@ template<typename T>
 int shard_data_into_clusters(const std::string data_file, float *pivots,
                              const size_t num_centers, const size_t dim,
                              const size_t k_base, std::string prefix_path) {
+  DISKANN_NVTX_RANGE("shard_data_into_clusters");
   _u64 read_blk_size = 64 * 1024 * 1024;
   //  _u64 write_blk_size = 64 * 1024 * 1024;
   // create cached reader + writer
@@ -903,6 +983,7 @@ int shard_data_into_clusters_only_ids(const std::string data_file,
                                       float *pivots, const size_t num_centers,
                                       const size_t dim, const size_t k_base,
                                       std::string prefix_path) {
+    DISKANN_NVTX_RANGE("shard_data_into_clusters_only_ids");
     size_t k_candidates = num_centers;
 
     if (k_base == 0 || k_base > k_candidates) {
@@ -1099,6 +1180,7 @@ template<typename T>
 int partition(const std::string data_file, const float sampling_rate,
               size_t num_parts, size_t max_k_means_reps,
               const std::string prefix_path, size_t k_base) {
+  DISKANN_NVTX_RANGE("partition");
   size_t train_dim;
   size_t num_train;
   std::unique_ptr<float[]> train_data_float = nullptr;
@@ -1159,23 +1241,44 @@ int partition_with_ram_budget(const std::string data_file,
                               const double sampling_rate, double ram_budget,
                               size_t            graph_degree,
                               const std::string prefix_path, size_t k_base, bool use_gpu/*=false*/) {
+  DISKANN_NVTX_RANGE("partition_with_ram_budget");
   size_t train_dim;
   size_t num_train;
-  std::unique_ptr<float[]> train_data_float = nullptr;
-  size_t max_k_means_reps = 10;
-
-  int  num_parts = 3;
-  bool fit_in_ram = false;
-
-  gen_random_slice<T>(data_file, sampling_rate, train_data_float, num_train,
-                      train_dim);
-
   size_t test_dim;
   size_t num_test;
+  std::unique_ptr<float[]> train_data_float = nullptr;
   std::unique_ptr<float[]> test_data_float = nullptr;
-  gen_random_slice<T>(data_file, sampling_rate, test_data_float, num_test,
-                      test_dim);
-  
+  float* train_data_float_ptr = nullptr;
+  float* test_data_float_ptr = nullptr;
+  size_t max_k_means_reps = 10;
+
+  size_t num_parts = 3;
+  bool   fit_in_ram = false;
+  bool   sampled_to_pinned = false;
+
+#ifdef KNOWHERE_WITH_CUVS
+  std::unique_ptr<raft::pinned_matrix<float, int64_t>> train_data_pinned;
+  std::unique_ptr<raft::pinned_matrix<float, int64_t>> test_data_pinned;
+  if (is_gpu_available()) {
+    gen_random_slice_gpu<T>(data_file, sampling_rate, train_data_pinned, num_train,
+                            train_dim);
+    gen_random_slice_gpu<T>(data_file, sampling_rate, test_data_pinned, num_test,
+                            test_dim);
+    train_data_float_ptr = train_data_pinned->data_handle();
+    test_data_float_ptr = test_data_pinned->data_handle();
+    sampled_to_pinned = true;
+  }
+#endif
+  if (!sampled_to_pinned) {
+    gen_random_slice<T>(data_file, sampling_rate, train_data_float, num_train,
+                        train_dim);
+    gen_random_slice<T>(data_file, sampling_rate, test_data_float, num_test,
+                        test_dim);
+
+    train_data_float_ptr = train_data_float.get();
+    test_data_float_ptr = test_data_float.get();
+  }
+
   std::unique_ptr<float[]> pivot_data = nullptr;
   std::string cur_file = std::string(prefix_path);
   std::string output_file;
@@ -1203,17 +1306,17 @@ int partition_with_ram_budget(const std::string data_file,
       } else {
         auto const& res = raft::device_resources_manager::get_device_resources();
         LOG_KNOWHERE_INFO_ << "Running k-means with " << num_parts << " clusters " << num_train << " " << train_dim << " ...using GPU!";
-        kmeans_gpu(res,train_data_float.get(), num_train, train_dim,
+        kmeans_gpu(res,train_data_float_ptr, num_train, train_dim,
                 num_parts, max_k_means_reps, pivot_data.get(), true);
         used_gpu = true;
       }
     }
 #endif
     if(!used_gpu) {
-      kmeans::kmeanspp_selecting_pivots(train_data_float.get(), num_train, train_dim,
+      kmeans::kmeanspp_selecting_pivots(train_data_float_ptr, num_train, train_dim,
                                         pivot_data.get(), num_parts);
 
-      kmeans::run_lloyds(train_data_float.get(), num_train, train_dim, pivot_data.get(),
+      kmeans::run_lloyds(train_data_float_ptr, num_train, train_dim, pivot_data.get(),
                          num_parts, max_k_means_reps, NULL, NULL);
     }
 
@@ -1221,7 +1324,7 @@ int partition_with_ram_budget(const std::string data_file,
     // closest clusters.
 
     std::vector<size_t> cluster_sizes;
-    estimate_cluster_sizes(test_data_float.get(), num_test, pivot_data.get(), num_parts,
+    estimate_cluster_sizes(test_data_float_ptr, num_test, pivot_data.get(), num_parts,
                            train_dim, k_base, cluster_sizes);
 
     for (auto &p : cluster_sizes) {
@@ -1256,6 +1359,7 @@ int partition_with_ram_budget(const std::string data_file,
 template <typename T>
 int partition_calc_kmeans(const std::string &data_file, const std::string &output_file, size_t k)
 {
+    DISKANN_NVTX_RANGE("partition_calc_kmeans");
     std::ifstream base_reader(data_file, std::ios::binary);
     uint32_t npts32, ndims32;
     base_reader.read(reinterpret_cast<char*>(&npts32), sizeof(uint32_t));
@@ -1289,6 +1393,10 @@ int partition_calc_kmeans(const std::string &data_file, const std::string &outpu
         LOG_KNOWHERE_INFO_ << "Running k-means with " << k << " clusters...using GPU!";
         kmeans_medoids_gpu(res,train_data_float.get(), num_train, train_dim,
                 k, kNumOfIterations, centroids.data(), false, medoids.data());
+        // kmeans_medoids_gpu returns positions in the sample, map them back to dataset ids
+        for (size_t i = 0; i < k; i++) {
+          medoids[i] = sampled_ids[medoids[i]];
+        }
         used_gpu = true;
       }
     }

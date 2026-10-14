@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
-# This script is to modify CMakeLists.txt to build knowhere for certain GPU serials
-#   GTX 1060 - sm_61
-#   GTX 1660 - sm_75
-#   GTX 2080 SUPER - sm_75
-sed 's/set(CMAKE_CUDA_ARCHITECTURES .*$/set(CMAKE_CUDA_ARCHITECTURES \"75-real\")/' CMakeLists.txt > tmp
-mv tmp CMakeLists.txt
+# CUDA architectures are configured in CMakeLists.txt (default: RAPIDS).
+# For faster local iteration on the current GPU: make WITH_GPU=True CUDA_ARCHITECTURES=NATIVE
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "Warning: nvidia-smi not found; GPU build may fail at runtime." >&2
+fi

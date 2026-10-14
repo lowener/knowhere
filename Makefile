@@ -84,6 +84,11 @@ ifdef WITH_GPU
     CONAN_SETTINGS += -o \&:with_cuvs=True
 endif
 
+# Override CUDA arch, e.g. CUDA_ARCHITECTURES=NATIVE for faster local builds.
+ifdef CUDA_ARCHITECTURES
+export CMAKE_CUDA_ARCHITECTURES := $(CUDA_ARCHITECTURES)
+endif
+
 ifdef WITH_UT
     CONAN_SETTINGS += -o \&:with_ut=True
 endif
@@ -138,7 +143,8 @@ endif
 # ---------- Test ----------
 
 test: ## Run unit tests (requires prior build with WITH_UT=True)
-	@$(BUILD_DIR)/$(BUILD_TYPE)/tests/ut/knowhere_tests
+	@source $(BUILD_DIR)/$(BUILD_TYPE)/generators/conanrun.sh && \
+		$(BUILD_DIR)/$(BUILD_TYPE)/tests/ut/knowhere_tests
 
 # ---------- Code quality ----------
 

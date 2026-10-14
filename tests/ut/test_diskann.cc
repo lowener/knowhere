@@ -26,6 +26,7 @@
 #include "index/diskann/diskann_config.h"
 #include "knowhere/comp/brute_force.h"
 #include "knowhere/comp/knowhere_check.h"
+#include "knowhere/comp/knowhere_config.h"
 #include "knowhere/expected.h"
 #include "knowhere/index/index_factory.h"
 #include "knowhere/utils.h"
@@ -537,6 +538,65 @@ TEST_CASE("Test DiskANN Build Index", "[diskann]") {
         }
         fs::remove_all(kDir);
         fs::remove(kDir);
+    }
+}
+
+TEST_CASE("Test DiskANN Build Big Index", "[diskann]") {
+    knowhere::KnowhereConfig::SetRaftMemPool();
+    auto version = GenTestVersionList();
+    knowhere::Status test_stat;
+    if (is_gpu_available()) {
+        auto start = std::chrono::high_resolution_clock::now();
+        auto millionNumRows = 1000000 * 5;
+        for (const uint32_t dim : {kLargeDim}) {
+            fs::remove_all(kDir);
+            fs::remove(kDir);
+            fs::remove_all(kL2IndexDir);
+            REQUIRE_NOTHROW(fs::create_directories(kL2IndexDir));
+
+            auto base_gen = [=] {
+                knowhere::Json json;
+                json["dim"] = dim;
+                json["metric_type"] = knowhere::metric::L2;
+                json["k"] = kK;
+                return json;
+            };
+
+            auto build_gen = [=]() {
+                knowhere::Json json = base_gen();
+                json["index_prefix"] = kL2IndexPrefix;
+                json["data_path"] = kRawDataPath;
+                json["max_degree"] = 64;
+                json["search_list_size"] = 128;
+                json["pq_code_budget_gb"] = sizeof(float) * dim * millionNumRows * 0.03125 / (1024 * 1024 * 1024);
+                json["build_dram_budget_gb"] = 0.4;
+                json["rearrange"] = true;
+                json["inline_pq"] = 0;
+                json["pq_cache_size"] = 0;
+                json["num_entry_points"] = 100;
+                return json;
+            };
+
+            auto base_ds = GenDataSet(millionNumRows, dim, 30);
+            auto base_ptr = static_cast<const float*>(base_ds->GetTensor());
+            WriteRawDataToDisk<float>(kRawDataPath, base_ptr, millionNumRows, dim);
+
+            std::shared_ptr<milvus::FileManager> file_manager = std::make_shared<milvus::LocalFileManager>();
+            auto diskann_index_pack = knowhere::Pack(file_manager);
+
+            knowhere::DataSetPtr ds_ptr = nullptr;
+            auto aisaq =
+                knowhere::IndexFactory::Instance().Create<knowhere::fp32>("AISAQ", version, diskann_index_pack).value();
+            auto build_json = build_gen().dump();
+            knowhere::Json json = knowhere::Json::parse(build_json);
+            aisaq.Build(ds_ptr, json);
+        }
+        // fs::remove_all(kDir);
+        // fs::remove(kDir);
+        fs::remove_all(kL2IndexDir);
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+        std::cout << "Total build time: " << duration.count() << " ms" << std::endl;
     }
 }
 #endif

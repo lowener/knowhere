@@ -14,11 +14,21 @@
 # the License.
 
 add_definitions(-DKNOWHERE_WITH_CUVS)
+
+# cuVS builds its sources with -Wall -Werror (see cuVS ConfigureCUDA.cmake).
+# GCC 12 emits a false-positive -Wrestrict on std::string concatenation in some
+# RAPIDS sources (e.g. cuVS' nvjitlink_checker.cpp), which breaks the build.
+# Demote it from an error to a warning for the whole GPU build.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  string(APPEND CMAKE_CXX_FLAGS " -Wno-error=restrict")
+  string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=-Wno-error=restrict")
+endif()
+
 set(CUVS_VERSION "${RAPIDS_VERSION}")
 set(CUVS_FORK "rapidsai")
 # Note: cuVS 26.02 officially supports CUDA 12.9+. Building with CUDA 12.2
 # is untested upstream and may break with future cuVS patches.
-set(CUVS_PINNED_TAG "v26.02.00")
+set(CUVS_PINNED_TAG "v${RAPIDS_VERSION}.00")
 
 rapids_find_package(CUDAToolkit REQUIRED BUILD_EXPORT_SET knowhere-exports
                     INSTALL_EXPORT_SET knowhere-exports)
@@ -52,8 +62,11 @@ function(find_and_configure_cuvs)
     "BUILD_TESTS OFF"
     "BUILD_BENCH OFF"
     "BUILD_MG_ALGOS ${PKG_BUILD_MG_ALGOS}"
+    # knowhere does not use cuvs::neighbors::hnsw; cuVS 26.10 otherwise defines the
+    # hnswlib target twice and configuration fails.
+    "BUILD_CAGRA_HNSWLIB OFF"
     "CUVS_USE_FAISS_STATIC OFF" # Turn this on to build FAISS into your binary
-    "CUVS_NVTX OFF")
+    "CUVS_NVTX ON")
 
   if(cuvs_ADDED)
     message(VERBOSE "KNOWHERE: Using CUVS located in ${cuvs_SOURCE_DIR}")

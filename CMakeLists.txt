@@ -24,7 +24,11 @@ include(cmake/utils/platform_check.cmake)
 
 knowhere_option(WITH_CUVS "Build with CUVS indexes" OFF)
 if(WITH_CUVS)
-  set(CMAKE_CUDA_ARCHITECTURES RAPIDS)
+  # RAPIDS expands to all supported GPU architectures (incl. sm_90 for H100).
+  # Override at build time: make WITH_GPU=True CUDA_ARCHITECTURES=NATIVE
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "RAPIDS")
+  endif()
   set(CMAKE_CUDA_STANDARD 20)
   include(cmake/libs/librapids.cmake)
   project(knowhere CXX C CUDA)
@@ -94,6 +98,7 @@ include_directories(${folly_INCLUDE_DIRS})
 
 find_package(nlohmann_json REQUIRED)
 find_package(glog REQUIRED)
+find_package(gflags REQUIRED)
 find_package(prometheus-cpp REQUIRED)
 find_package(fmt REQUIRED)
 if(NOT TARGET fmt::fmt-header-only)
@@ -294,6 +299,13 @@ endif()
 
 target_link_libraries(knowhere PUBLIC ${KNOWHERE_LINKER_LIBS})
 target_link_libraries(knowhere PUBLIC Boost::boost nlohmann_json::nlohmann_json glog::glog Folly::folly prometheus-cpp::core opentelemetry-cpp::opentelemetry_trace)
+
+if(NOT APPLE)
+  # glog depends on gflags, but --as-needed drops the unused direct link and
+  # the loader resolves glog's gflags dependency to the system library instead
+  # of Conan's (ABI mismatch: google:: vs gflags:: namespace).
+  target_link_libraries(knowhere PUBLIC "-Wl,--no-as-needed" gflags::gflags "-Wl,--as-needed")
+endif()
 
 if (WITH_CARDINAL)
   target_compile_definitions(knowhere PRIVATE

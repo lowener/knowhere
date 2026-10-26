@@ -16,6 +16,7 @@
 
 #include "index/sparse/block_max_data.h"
 #include "index/sparse/scorer.h"
+#include "index/sparse/searcher/bulk_simd.h"
 #include "index/sparse/searcher/searcher.h"
 #include "knowhere/bitsetview.h"
 
@@ -42,14 +43,16 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
             return scorer(index_cursor.vec_id(), index_cursor.val());
         }
 
+        template <PostingFilterMode FilterMode>
         void
         next() noexcept {
-            index_cursor.next();
+            NextPosting<FilterMode>(index_cursor);
         }
 
+        template <PostingFilterMode FilterMode>
         void
         next_geq(uint32_t vec_id) noexcept {
-            index_cursor.next_geq(vec_id);
+            NextPostingGEQ<FilterMode>(index_cursor, vec_id);
         }
 
         [[nodiscard]] bool
@@ -89,7 +92,8 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
           }()),
           max_vec_id_(filter_bounds_.upper_bound),
           scorer_type_(search_scorer->config().scorer_type),
-          bulk_query_nnz_threshold_(bulk_query_nnz_threshold) {
+          bulk_query_nnz_threshold_(bulk_query_nnz_threshold),
+          filter_mode_(GetPostingFilterMode(bitset, max_vec_id_)) {
     }
 
     void
@@ -99,9 +103,9 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
         }
 
         if (scorer_type_ == IndexScorerType::BM25) {
-            run_sorted<IndexScorerType::BM25>();
+            run_sorted_dispatch<IndexScorerType::BM25>();
         } else {
-            run_sorted<IndexScorerType::IP>();
+            run_sorted_dispatch<IndexScorerType::IP>();
         }
     }
 
@@ -117,7 +121,7 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
         return upper_bounds;
     }
 
-    template <IndexScorerType ScorerType>
+    template <IndexScorerType ScorerType, PostingFilterMode FilterMode>
     void
     run_sorted_linear() {
         auto upper_bounds = calc_upper_bounds();
@@ -150,7 +154,7 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
             for (size_t i = 0; i < ne_start_cursor_id; ++i) {
                 if (cursors_[i].vec_id() == curr_cand_vec_id) {
                     score += score_term(cursors_[i]);
-                    cursors_[i].next();
+                    cursors_[i].template next<FilterMode>();
                 }
                 if (cursors_[i].vec_id() < next_cand_vec_id) {
                     next_cand_vec_id = cursors_[i].vec_id();
@@ -172,7 +176,7 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
                 if (new_score > threshold) {
                     // try to complete evaluation with non-essential lists
                     for (size_t i = ne_start_cursor_id; i < cursors_.size(); ++i) {
-                        cursors_[i].next_geq(curr_cand_vec_id);
+                        cursors_[i].template next_geq<FilterMode>(curr_cand_vec_id);
                         if (cursors_[i].vec_id() == curr_cand_vec_id) {
                             new_score += score_term(cursors_[i]);
                         }
@@ -197,7 +201,7 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
         }
     }
 
-    template <IndexScorerType ScorerType>
+    template <IndexScorerType ScorerType, PostingFilterMode FilterMode>
     void
     run_sorted_bulk() {
         // Batch essential postings in a fixed-size inner window. Non-essential block maxima are cached over their
@@ -277,7 +281,7 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
             float remaining_block_upper_bound = cached_block_upper_bound;
             for (size_t i = essential_count; i < cursors_.size(); ++i) {
                 auto& cursor = cursors_[i];
-                cursor.next_geq(vec_id);
+                cursor.template next_geq<FilterMode>(vec_id);
                 if (cursor.vec_id() == vec_id) {
                     score += score_term(cursor, doc_norm);
                 }
@@ -329,7 +333,7 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
                         doc_norm = bm25_context_.doc_norm(vec_id);
                     }
                     const float score = score_term(cursor, doc_norm);
-                    cursor.next();
+                    cursor.template next<FilterMode>();
                     if constexpr (ScorerType == IndexScorerType::BM25) {
                         if (cursor.vec_id() < max_vec_id_) {
                             bm25_context_.prefetch_document(cursor.vec_id());
@@ -346,16 +350,12 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
 
                 for (size_t i = 0; i < essential_count; ++i) {
                     auto& cursor = cursors_[i];
-                    while (cursor.vec_id() < window_max) {
-                        const uint32_t vec_id = cursor.vec_id();
-                        float doc_norm = 0.0F;
-                        if constexpr (ScorerType == IndexScorerType::BM25) {
-                            doc_norm = bm25_context_.doc_norm(vec_id);
-                        }
-                        const uint32_t offset = vec_id - window_min;
-                        window_scores[offset] += score_term(cursor, doc_norm);
-                        window_matches[offset / 64] |= uint64_t{1} << (offset % 64);
-                        cursor.next();
+                    if constexpr (ScorerType == IndexScorerType::BM25) {
+                        AccumulateBM25Bulk<FilterMode>(cursor.index_cursor, cursor.qval_p1, bm25_context_, window_min,
+                                                       window_max, window_scores.data(), window_matches.data());
+                    } else {
+                        AccumulateIPBulk<FilterMode>(cursor.index_cursor, cursor.qval_p1, window_min, window_max,
+                                                     window_scores.data(), window_matches.data());
                     }
                     if constexpr (ScorerType == IndexScorerType::BM25) {
                         if (cursor.vec_id() < max_vec_id_) {
@@ -367,6 +367,10 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
                 const size_t window_word_count = (static_cast<size_t>(window_max - window_min) + 63) / 64;
                 for (size_t word_index = 0; word_index < window_word_count; ++word_index) {
                     uint64_t matches = std::exchange(window_matches[word_index], 0);
+                    if (topk_.Full() && std::popcount(matches) >= 16) {
+                        matches = FilterBulkCandidates(window_scores.data() + word_index * 64, matches,
+                                                       upper_bounds[essential_count], topk_.Threshold());
+                    }
                     while (matches != 0) {
                         const uint32_t bit_index = static_cast<uint32_t>(std::countr_zero(matches));
                         matches &= matches - 1;
@@ -388,13 +392,31 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
         }
     }
 
-    template <IndexScorerType ScorerType>
+    template <IndexScorerType ScorerType, PostingFilterMode FilterMode>
     void
     run_sorted() {
         if (cursors_.size() >= bulk_query_nnz_threshold_) {
-            run_sorted_bulk<ScorerType>();
+            run_sorted_bulk<ScorerType, FilterMode>();
         } else {
-            run_sorted_linear<ScorerType>();
+            run_sorted_linear<ScorerType, FilterMode>();
+        }
+    }
+
+    template <IndexScorerType ScorerType>
+    void
+    run_sorted_dispatch() {
+        // TODO: Check whether template-based handling of filter_mode_ is really needed, or whether passing
+        // filter_mode_ directly as a field to the hot path performs equally well.
+        switch (filter_mode_) {
+            case PostingFilterMode::None:
+                run_sorted<ScorerType, PostingFilterMode::None>();
+                break;
+            case PostingFilterMode::Direct:
+                run_sorted<ScorerType, PostingFilterMode::Direct>();
+                break;
+            case PostingFilterMode::Generic:
+                run_sorted<ScorerType, PostingFilterMode::Generic>();
+                break;
         }
     }
 
@@ -419,5 +441,6 @@ class BlockMaxMaxScoreSearcher : public RankedSearcher {
     uint32_t max_vec_id_;
     IndexScorerType scorer_type_;
     const size_t bulk_query_nnz_threshold_;
+    const PostingFilterMode filter_mode_;
 };
 }  // namespace knowhere::sparse::inverted

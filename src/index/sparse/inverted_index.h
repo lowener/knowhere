@@ -50,6 +50,9 @@ enum class InvertedIndexEncoding : uint32_t {
     BLOCK_MASKEDVBYTE = 2,
     FIXED_DOCID_WINDOWS = 3,
     BLOCK_ADAPTIVE = 4,
+    FIXED_DOCID_WINDOWS_U12_E5M7 = 5,
+    FIXED_DOCID_WINDOWS_U12_U4_LUT = 6,
+    FIXED_DOCID_WINDOWS_U16_U4_LUT = 7,
 };
 
 enum class InvertedIndexPrometheusBuildStats : uint32_t { DATASET_NNZ_STATS = 0, POSTING_LIST_LENGTH_STATS = 1 };
@@ -144,6 +147,7 @@ struct InvertedIndexSearchParams {
     size_t bulk_query_nnz_threshold;
     float refine_query_mass_percentage = 1.0f;
     float refine_k = 1.0f;
+    float sindi_filter_threshold = 0.0f;
 
     struct {
         float drop_ratio_search;
@@ -561,7 +565,7 @@ CRTPInvertedIndex<IndexType, DType, IsGrowable>::convert_to_raw_data(MemoryIOWri
         auto plist_iter = static_cast<const IndexType*>(this)->get_dim_plist_cursor(i, bitset);
         while (plist_iter.valid()) {
             raw_rows[plist_iter.vec_id()].push_back(std::make_pair(dim_map_reverse[i], plist_iter.val()));
-            plist_iter.next();
+            NextPosting<PostingFilterMode::None>(plist_iter);
         }
     }
 
@@ -596,14 +600,28 @@ CRTPInvertedIndex<IndexType, DType, IsGrowable>::get_all_distances(
         search_scorer = std::make_shared<IPIndexScorer>();
     }
 
-    const auto* self = static_cast<const IndexType*>(this);
-    for (const auto& [dim_id, dim_val] : q_vec) {
-        auto index_cursor = self->get_dim_plist_cursor(dim_id, bitset);
-        auto scorer = search_scorer->dim_scorer(dim_val);
-        while (index_cursor.valid()) {
-            distances[index_cursor.vec_id()] += scorer(index_cursor.vec_id(), index_cursor.val());
-            index_cursor.next();
+    const auto accumulate = [&]<PostingFilterMode FilterMode>() {
+        const auto* self = static_cast<const IndexType*>(this);
+        for (const auto& [dim_id, dim_val] : q_vec) {
+            auto index_cursor = self->get_dim_plist_cursor(dim_id, bitset);
+            auto scorer = search_scorer->dim_scorer(dim_val);
+            while (index_cursor.valid()) {
+                distances[index_cursor.vec_id()] += scorer(index_cursor.vec_id(), index_cursor.val());
+                NextPosting<FilterMode>(index_cursor);
+            }
         }
+    };
+
+    switch (GetPostingFilterMode(bitset, this->nr_rows_)) {
+        case PostingFilterMode::None:
+            accumulate.template operator()<PostingFilterMode::None>();
+            break;
+        case PostingFilterMode::Direct:
+            accumulate.template operator()<PostingFilterMode::Direct>();
+            break;
+        case PostingFilterMode::Generic:
+            accumulate.template operator()<PostingFilterMode::Generic>();
+            break;
     }
 
     return distances;

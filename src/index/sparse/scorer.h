@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <vector>
 
 namespace knowhere::sparse::inverted {
@@ -132,7 +133,8 @@ struct BM25IndexScorer : public IndexScorer {
 
 class BM25ScoringContext {
  public:
-    explicit BM25ScoringContext(const std::vector<float>& row_sums, const IndexScorer& scorer) : row_sums_(row_sums) {
+    // The search request owns the immutable row-sum storage for this context's lifetime.
+    explicit BM25ScoringContext(std::span<const float> row_sums, const IndexScorer& scorer) : row_sums_(row_sums) {
         if (scorer.config().scorer_type == IndexScorerType::BM25) {
             const auto* bm25_scorer = dynamic_cast<const BM25IndexScorer*>(&scorer);
             assert(bm25_scorer != nullptr);
@@ -157,13 +159,18 @@ class BM25ScoringContext {
         return bm25_score_with_doc_norm(qval_p1, tf, p2_, doc_norm);
     }
 
+    [[nodiscard]] float
+    denominator_bias() const noexcept {
+        return p2_;
+    }
+
     void
     prefetch_document(uint32_t vec_id) const noexcept {
         __builtin_prefetch(&row_sums_[vec_id], 0, 3);
     }
 
  private:
-    const std::vector<float>& row_sums_;
+    std::span<const float> row_sums_;
     float p1_{1.0F};
     float p2_{0.0F};
     float p3_{0.0F};

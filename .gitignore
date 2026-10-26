@@ -78,9 +78,12 @@ graph_info.json
 .eggs
 *.egg-info
 
-# Claude Code plans (local only)
+# Agent plans (local only)
 docs/plans/
 docs/superpowers/
 
 # Test artifacts (Catch2 tests write serialized indexes into CWD)
 *.index
+
+# Java build output
+java/target/

@@ -22,20 +22,47 @@ include(cmake/utils/utils.cmake)
 include(cmake/utils/compile_flags.cmake)
 include(cmake/utils/platform_check.cmake)
 
+# cardinal is an enterprise vector search engine and can only be enabled for
+# cloud environment
+knowhere_option(WITH_CARDINAL "Build with cardinal" OFF)
+knowhere_option(WITH_GPU "Build with GPU support (cuVS or Cardinal)" OFF)
 knowhere_option(WITH_CUVS "Build with CUVS indexes" OFF)
-if(WITH_CUVS)
-  # RAPIDS expands to all supported GPU architectures (incl. sm_90 for H100).
-  # Override at build time: make WITH_GPU=True CUDA_ARCHITECTURES=NATIVE
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "RAPIDS")
+# Select the GPU backend through WITH_CARDINAL.
+# Keep this as a local value so an implicit cuVS selection is not cached when
+# reconfiguring the same build directory for Cardinal.
+if(WITH_GPU AND NOT WITH_CARDINAL)
+  set(WITH_CUVS ON)
+endif()
+
+if(WITH_CUVS OR (WITH_CARDINAL AND WITH_GPU))
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    if(WITH_CARDINAL AND WITH_GPU)
+      set(CMAKE_CUDA_ARCHITECTURES "120")
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES RAPIDS)
+    endif()
   endif()
+endif()
+
+if(WITH_CUVS)
   set(CMAKE_CUDA_STANDARD 20)
   include(cmake/libs/librapids.cmake)
   project(knowhere CXX C CUDA)
   include(cmake/libs/libcuvs.cmake)
+elseif(WITH_CARDINAL AND WITH_GPU)
+  enable_language(CUDA)
 endif()
 
 knowhere_option(WITH_UT "Build with UT test" OFF)
+knowhere_option(WITH_C_API "Build the public C API" OFF)
+knowhere_option(WITH_JNI "Build Java JNI bindings" OFF)
+knowhere_option(WITH_C_API_TESTS "Build C API contract tests" OFF)
+if(WITH_JNI)
+  set(WITH_C_API ON)
+endif()
+if(WITH_C_API_TESTS AND NOT WITH_C_API)
+  message(FATAL_ERROR "WITH_C_API_TESTS requires WITH_C_API or WITH_JNI")
+endif()
 knowhere_option(WITH_ASAN "Build with ASAN" OFF)
 knowhere_option(WITH_DISKANN "Build with diskann index" OFF)
 knowhere_option(WITH_SVS "Build with SVS (Intel Scalable Vector Search) index" OFF)
@@ -51,9 +78,6 @@ knowhere_option(WITH_COMPILE_PRUNE "Enable compile prune" ON)
 set(KNOWHERE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 set(KNOWHERE_THRID_ROOT ${KNOWHERE_ROOT}/thirdparty)
 
-# cardinal is an enterprise vector search engine and can only be enabled for
-# cloud environment
-knowhere_option(WITH_CARDINAL "Build with cardinal" OFF)
 knowhere_option(CARDINAL_VERSION_FORCE_CHECKOUT
                 "Force checkout cardinal version" OFF)
 
@@ -179,7 +203,7 @@ if(WITH_LIGHT)
   list(REMOVE_ITEM KNOWHERE_SRCS ${KNOWHERE_TRACER_SRCS})
 endif()
 
-set(KNOWHERE_LINKER_LIBS "")
+set(KNOWHERE_PRIVATE_LIBS "")
 set(CARDINAL_LIBS "")
 
 if(WITH_DISKANN)
@@ -274,22 +298,26 @@ endif()
 include_directories(src)
 include_directories(include)
 
-list(APPEND KNOWHERE_LINKER_LIBS Boost::boost)
-list(APPEND KNOWHERE_LINKER_LIBS faiss)
-list(APPEND KNOWHERE_LINKER_LIBS glog::glog)
-list(APPEND KNOWHERE_LINKER_LIBS nlohmann_json::nlohmann_json)
-list(APPEND KNOWHERE_LINKER_LIBS prometheus-cpp::core prometheus-cpp::push)
-list(APPEND KNOWHERE_LINKER_LIBS fmt::fmt)
-list(APPEND KNOWHERE_LINKER_LIBS Folly::folly)
-list(APPEND KNOWHERE_LINKER_LIBS milvus-common::milvus-common)
-list(APPEND KNOWHERE_LINKER_LIBS simde::simde)
+list(APPEND KNOWHERE_PRIVATE_LIBS faiss)
+list(APPEND KNOWHERE_PRIVATE_LIBS prometheus-cpp::push)
+list(APPEND KNOWHERE_PRIVATE_LIBS fmt::fmt)
+list(APPEND KNOWHERE_PRIVATE_LIBS simde::simde)
+
+set(KNOWHERE_PUBLIC_LIBS
+    Boost::boost
+    nlohmann_json::nlohmann_json
+    glog::glog
+    Folly::folly
+    milvus-common::milvus-common
+    prometheus-cpp::core
+    opentelemetry-cpp::opentelemetry_trace
+    OpenMP::OpenMP_CXX)
 
 add_library(knowhere SHARED ${KNOWHERE_SRCS})
-add_dependencies(knowhere ${KNOWHERE_LINKER_LIBS})
 if(WITH_CUVS)
   list(
     APPEND
-    KNOWHERE_LINKER_LIBS
+    KNOWHERE_PRIVATE_LIBS
     raft::raft
     cuvs::cuvs
     CUDA::cublas
@@ -297,8 +325,10 @@ if(WITH_CUVS)
     CUDA::cusolver)
 endif()
 
-target_link_libraries(knowhere PUBLIC ${KNOWHERE_LINKER_LIBS})
-target_link_libraries(knowhere PUBLIC Boost::boost nlohmann_json::nlohmann_json glog::glog Folly::folly prometheus-cpp::core opentelemetry-cpp::opentelemetry_trace)
+target_link_libraries(knowhere
+    PRIVATE ${KNOWHERE_PRIVATE_LIBS}
+    PUBLIC ${KNOWHERE_PUBLIC_LIBS})
+target_compile_features(knowhere PUBLIC cxx_std_20)
 
 if(NOT APPLE)
   # glog depends on gflags, but --as-needed drops the unused direct link and
@@ -315,6 +345,7 @@ if (WITH_CARDINAL)
 endif()
 
 target_include_directories(knowhere PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(knowhere PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/faiss)
 
 if(WITH_UT)
   find_package(Catch2 REQUIRED)
@@ -330,6 +361,51 @@ if(WITH_FAISS_TESTS)
 endif()
 
 install(TARGETS knowhere
-        DESTINATION ${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR})
+        DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY "${PROJECT_SOURCE_DIR}/include/knowhere"
-        DESTINATION "${CMAKE_INSTALL_PREFIX}/include")
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+
+if(WITH_C_API)
+  include(cmake/binding_licenses.cmake)
+  knowhere_collect_binding_licenses("${PROJECT_SOURCE_DIR}" "${PROJECT_BINARY_DIR}" "${WITH_DISKANN}")
+  add_library(knowhere_c SHARED src/c_api/c_api.cc)
+  target_link_libraries(knowhere_c PRIVATE knowhere)
+  target_include_directories(knowhere_c PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(knowhere_c PRIVATE KNOWHERE_C_API_BUILD)
+  set_target_properties(knowhere_c PROPERTIES VERSION 1.0.0 SOVERSION 1
+    CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)
+  if(APPLE)
+    set_target_properties(knowhere_c PROPERTIES INSTALL_RPATH "@loader_path")
+  else()
+    set_target_properties(knowhere_c PROPERTIES INSTALL_RPATH "$ORIGIN")
+  endif()
+  install(TARGETS knowhere_c LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  if(WITH_C_API_TESTS)
+    enable_testing()
+    add_executable(knowhere_c_api_test tests/c_api/test_c_api.c)
+    target_link_libraries(knowhere_c_api_test PRIVATE knowhere_c)
+    add_test(NAME knowhere_c_api COMMAND knowhere_c_api_test)
+    find_package(Threads REQUIRED)
+    add_executable(knowhere_c_api_concurrency_test tests/c_api/test_concurrency.c)
+    target_link_libraries(knowhere_c_api_concurrency_test PRIVATE knowhere_c Threads::Threads)
+    add_test(NAME knowhere_c_api_concurrency COMMAND knowhere_c_api_concurrency_test)
+    if(WITH_DISKANN)
+      add_executable(knowhere_c_api_diskann_test tests/c_api/test_diskann.c)
+      target_link_libraries(knowhere_c_api_diskann_test PRIVATE knowhere_c)
+      add_test(NAME knowhere_c_api_diskann COMMAND knowhere_c_api_diskann_test)
+      set_tests_properties(knowhere_c_api_diskann PROPERTIES TIMEOUT 300)
+    endif()
+    if(WITH_ASAN)
+      foreach(test_target knowhere_c_api_test knowhere_c_api_concurrency_test knowhere_c_api_diskann_test)
+        if(TARGET ${test_target})
+          target_compile_options(${test_target} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+          target_link_options(${test_target} PRIVATE -fsanitize=address)
+        endif()
+      endforeach()
+    endif()
+  endif()
+endif()
+
+if(WITH_JNI)
+  add_subdirectory(java)
+endif()

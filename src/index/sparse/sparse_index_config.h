@@ -35,6 +35,16 @@
 
 namespace knowhere {
 
+inline bool
+IsBm25U4QuantType(const std::string& quant) {
+    return quant == "u4_lut" || quant == "u4_lut_u12" || quant == "u4_lut_u16";
+}
+
+inline std::string
+NormalizeBm25U4QuantType(const std::string& quant) {
+    return quant == "u4_lut" ? "u4_lut_u12" : quant;
+}
+
 inline std::string
 NormalizeSparseInvertedIndexAlgo(std::string algo) {
     std::transform(algo.begin(), algo.end(), algo.begin(),
@@ -74,6 +84,8 @@ class SparseInvertedIndexConfig : public BaseConfig {
     CFG_STRING quant_type;
     CFG_FLOAT bm25_u8_max_overflow_ratio;
     CFG_INT sindi_window_size;
+    CFG_FLOAT sindi_bm25_filter_threshold;
+    CFG_FLOAT sindi_ip_filter_threshold;
 
     KNOWHERE_DECLARE_CONFIG(SparseInvertedIndexConfig) {
         KNOWHERE_CONFIG_DECLARE_FIELD(refine)
@@ -176,7 +188,9 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .for_deserialize_from_file();
         KNOWHERE_CONFIG_DECLARE_FIELD(quant_type)
             .description(
-                "quantization type for posting list values: fp16/fp32 for IP, u8/u16/u32/auto for BM25; u8 is "
+                "quantization type for posting list values: fp16/fp32/e5m7 for IP (e5m7 requires SINDI, window=4096), "
+                "u4_lut_u12/u4_lut_u16/u8/u16/u32/auto for BM25; u4_lut aliases u4_lut_u12; U4 requires sealed SINDI, "
+                "no refinement; U12 window<=4096; u8 is "
                 "supported only by sealed SINDI with index version >= 11; BM25 auto requires index version >= 11 "
                 "and resolves to u8/u16 for sealed SINDI or u16 for other indexes; the concrete type is persisted "
                 "in the index and restored automatically on load; the load parameter is used only for legacy "
@@ -197,6 +211,17 @@ class SparseInvertedIndexConfig : public BaseConfig {
             .set_range(1024, 65535)
             .set_default(4096)
             .for_train();
+        KNOWHERE_CONFIG_DECLARE_FIELD(sindi_bm25_filter_threshold)
+            .description(
+                "maximum window-local pass fraction for unpacked SINDI BM25 posting prefiltering; 0 disables it")
+            .set_default(1.0f / 64)
+            .set_range(0.0f, 1.0f)
+            .for_search();
+        KNOWHERE_CONFIG_DECLARE_FIELD(sindi_ip_filter_threshold)
+            .description("maximum window-local pass fraction for SINDI IP posting prefiltering; 0 disables it")
+            .set_default(1.0f / 512)
+            .set_range(0.0f, 1.0f)
+            .for_search();
     }
 
     Status
@@ -239,16 +264,19 @@ class SparseInvertedIndexConfig : public BaseConfig {
             auto qt = quant_type.value();
             auto mt = metric_type.value();
             if (mt == metric::IP) {
-                if (qt != "fp16" && qt != "fp32") {
+                if (qt != "fp16" && qt != "fp32" && qt != "e5m7") {
                     if (err_msg) {
-                        *err_msg = "quant_type for IP metric must be 'fp16' or 'fp32', got '" + qt + "'";
+                        *err_msg = "quant_type for IP metric must be 'fp16', 'fp32', or 'e5m7', got '" + qt + "'";
                     }
                     return Status::invalid_args;
                 }
             } else if (mt == metric::BM25) {
-                if (qt != "u8" && qt != "u16" && qt != "u32" && qt != "auto") {
+                if (!IsBm25U4QuantType(qt) && qt != "u8" && qt != "u16" && qt != "u32" && qt != "auto") {
                     if (err_msg) {
-                        *err_msg = "quant_type for BM25 metric must be 'u8', 'u16', 'u32', or 'auto', got '" + qt + "'";
+                        *err_msg =
+                            "quant_type for BM25 metric must be 'u4_lut'/'u4_lut_u12'/'u4_lut_u16', 'u8', 'u16', "
+                            "'u32', or 'auto', got '" +
+                            qt + "'";
                     }
                     return Status::invalid_args;
                 }

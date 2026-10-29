@@ -40,11 +40,13 @@
 #include "diskann/nvtx_helper.h"
 #include "diskann/utils.h"
 #include "knowhere/log.h"
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <raft/core/resources.hpp>
 #include <raft/core/host_mdarray.hpp>
+#include <raft/util/cudart_utils.hpp>
 #include <cuvs/neighbors/brute_force.hpp>
 #include <cuvs/preprocessing/quantize/pq.hpp>
 
@@ -397,15 +399,29 @@ int brute_force_gpu(const raft::resources &dev_resources, const T *h_data,
 
 }
 
+static std::unique_ptr<cuvs::preprocessing::quantize::pq::quantizer<float>>
+initialize_padded_pq_quantizer_gpu(const raft::resources& dev_resources,
+                                   const float* h_centroid,
+                                   const float* h_full_pivot_data,
+                                   size_t dim,
+                                   size_t num_centers,
+                                   size_t num_pq_chunks,
+                                   const uint32_t* chunk_offsets);
+
 std::unique_ptr<cuvs::preprocessing::quantize::pq::quantizer<float>>
 initialize_pq_quantizer_gpu(const raft::resources& dev_resources,
                             const float* h_centroid,
                             const float* h_full_pivot_data,
                             size_t dim,
                             size_t num_centers,
-                            size_t num_pq_chunks) {
+                            size_t num_pq_chunks,
+                            const uint32_t* chunk_offsets) {
+    if (num_pq_chunks != 0 && dim % num_pq_chunks != 0) {
+        return initialize_padded_pq_quantizer_gpu(dev_resources, h_centroid, h_full_pivot_data, dim, num_centers,
+                                                  num_pq_chunks, chunk_offsets);
+    }
     DISKANN_NVTX_RANGE("initialize_pq_quantizer_gpu");
-    if (num_centers != 256 || num_pq_chunks == 0 || (dim % num_pq_chunks != 0)) {
+    if (num_centers != 256 || num_pq_chunks == 0) {
         return nullptr;
     }
 
@@ -488,6 +504,132 @@ void transform_pq_gpu(const raft::resources& dev_resources,
             d_inflated_data_block.view(),
             std::make_optional(raft::make_const_mdspan(d_centroid_labels.view())));
         raft::copy(h_inflated_out, d_inflated_data_block.data_handle(), cur_blk_size * dim, stream);
+    }
+    raft::resource::sync_stream(dev_resources);
+}
+
+size_t padded_pq_chunk_width(const uint32_t* chunk_offsets, size_t num_pq_chunks) {
+    size_t width = 0;
+    for (size_t chunk = 0; chunk < num_pq_chunks; chunk++) {
+        width = std::max<size_t>(width, chunk_offsets[chunk + 1] - chunk_offsets[chunk]);
+    }
+    return width;
+}
+
+// Every chunk is zero-padded to padded_pq_chunk_width, since cuVS requires equal-width subspaces.
+static std::unique_ptr<cuvs::preprocessing::quantize::pq::quantizer<float>>
+initialize_padded_pq_quantizer_gpu(const raft::resources& dev_resources,
+                                   const float* h_centroid,
+                                   const float* h_full_pivot_data,
+                                   size_t dim,
+                                   size_t num_centers,
+                                   size_t num_pq_chunks,
+                                   const uint32_t* chunk_offsets) {
+    DISKANN_NVTX_RANGE("initialize_padded_pq_quantizer_gpu");
+    if (num_centers != 256 || num_pq_chunks == 0 || chunk_offsets[num_pq_chunks] != dim) {
+        return nullptr;
+    }
+
+    // Padded coordinates are zero in the centroid and in every pivot, so they add nothing to any distance.
+    const size_t subspace_dim = padded_pq_chunk_width(chunk_offsets, num_pq_chunks);
+    const size_t padded_dim = subspace_dim * num_pq_chunks;
+    std::vector<float> padded_centroid(padded_dim, 0.0f);
+    std::vector<float> pq_code_book_subspace_major(num_centers * padded_dim, 0.0f);
+    for (size_t chunk = 0; chunk < num_pq_chunks; chunk++) {
+        const size_t offset = chunk_offsets[chunk];
+        const size_t width = chunk_offsets[chunk + 1] - offset;
+        std::memcpy(padded_centroid.data() + chunk * subspace_dim, h_centroid + offset, width * sizeof(float));
+        for (size_t center = 0; center < num_centers; center++) {
+            std::memcpy(pq_code_book_subspace_major.data() + (chunk * num_centers + center) * subspace_dim,
+                        h_full_pivot_data + center * dim + offset, width * sizeof(float));
+        }
+    }
+
+    auto d_vq_code_book =
+        raft::make_device_matrix<float, uint32_t>(dev_resources, 1, static_cast<uint32_t>(padded_dim));
+    auto d_pq_code_book = raft::make_device_matrix<float, uint32_t>(
+        dev_resources, static_cast<uint32_t>(num_centers * num_pq_chunks), static_cast<uint32_t>(subspace_dim));
+    auto d_empty = raft::make_device_matrix<uint8_t, int64_t>(dev_resources, 0, 0);
+
+    auto stream = raft::resource::get_cuda_stream(dev_resources);
+    raft::copy(d_vq_code_book.data_handle(), padded_centroid.data(), padded_dim, stream);
+    raft::copy(d_pq_code_book.data_handle(), pq_code_book_subspace_major.data(), num_centers * padded_dim, stream);
+    raft::resource::sync_stream(dev_resources);
+
+    cuvs::cluster::kmeans::params km_params;
+    km_params.n_clusters = static_cast<int>(num_centers);
+    km_params.max_iter = 1;
+    km_params.n_init = 1;
+    auto pq_params = cuvs::preprocessing::quantize::pq::params(
+        8, static_cast<uint32_t>(num_pq_chunks), true, true, 1,
+        cuvs::preprocessing::quantize::pq::kmeans_params_variant(km_params));
+
+    return std::make_unique<cuvs::preprocessing::quantize::pq::quantizer<float>>(
+        cuvs::preprocessing::quantize::pq::quantizer<float>{
+            pq_params, cuvs::neighbors::vpq_dataset<float, int64_t>(
+                           std::move(d_vq_code_book), std::move(d_pq_code_book), std::move(d_empty))});
+}
+
+void transform_padded_pq_gpu(const raft::resources& dev_resources,
+                             const cuvs::preprocessing::quantize::pq::quantizer<float>& pq_quantizer,
+                             const float* h_block_data,
+                             size_t cur_blk_size,
+                             size_t dim,
+                             size_t num_pq_chunks,
+                             const uint32_t* chunk_offsets,
+                             float* d_block_data,
+                             float* d_padded_block_data,
+                             uint8_t* d_compressed_data_block,
+                             uint8_t* h_codes_out,
+                             float* h_inflated_out /*=nullptr*/) {
+    DISKANN_NVTX_RANGE("transform_padded_pq_gpu");
+    auto stream = raft::resource::get_cuda_stream(dev_resources);
+    const size_t subspace_dim = padded_pq_chunk_width(chunk_offsets, num_pq_chunks);
+    const size_t padded_dim = subspace_dim * num_pq_chunks;
+
+    raft::copy(d_block_data, h_block_data, cur_blk_size * dim, stream);
+    RAFT_CUDA_TRY(cudaMemsetAsync(d_padded_block_data, 0, cur_blk_size * padded_dim * sizeof(float), stream));
+    for (size_t chunk = 0; chunk < num_pq_chunks; chunk++) {
+        const size_t width = chunk_offsets[chunk + 1] - chunk_offsets[chunk];
+        if (width == 0) {
+            continue;
+        }
+        raft::copy_matrix<float>(d_padded_block_data + chunk * subspace_dim, padded_dim,
+                                 d_block_data + chunk_offsets[chunk], dim, width, cur_blk_size, stream);
+    }
+
+    auto d_padded_block_data_view = raft::make_device_matrix_view<const float, int64_t>(
+        d_padded_block_data, static_cast<int64_t>(cur_blk_size), static_cast<int64_t>(padded_dim));
+    auto d_compressed_data_block_view = raft::make_device_matrix_view<uint8_t, int64_t>(
+        d_compressed_data_block, static_cast<int64_t>(cur_blk_size), static_cast<int64_t>(num_pq_chunks));
+    cuvs::preprocessing::quantize::pq::transform(
+        dev_resources, pq_quantizer, d_padded_block_data_view, d_compressed_data_block_view);
+
+    raft::copy(h_codes_out, d_compressed_data_block, cur_blk_size * num_pq_chunks, stream);
+    if (h_inflated_out != nullptr) {
+        auto d_centroid_labels = raft::make_device_vector<uint32_t, int64_t>(
+            dev_resources, static_cast<int64_t>(cur_blk_size));
+        RAFT_CUDA_TRY(cudaMemsetAsync(d_centroid_labels.data_handle(),
+                                      0,
+                                      cur_blk_size * sizeof(uint32_t),
+                                      stream));
+        cuvs::preprocessing::quantize::pq::inverse_transform(
+            dev_resources,
+            pq_quantizer,
+            raft::make_const_mdspan(d_compressed_data_block_view),
+            raft::make_device_matrix_view<float, int64_t>(
+                d_padded_block_data, static_cast<int64_t>(cur_blk_size), static_cast<int64_t>(padded_dim)),
+            std::make_optional(raft::make_const_mdspan(d_centroid_labels.view())));
+        for (size_t chunk = 0; chunk < num_pq_chunks; chunk++) {
+            const size_t width = chunk_offsets[chunk + 1] - chunk_offsets[chunk];
+            if (width == 0) {
+                continue;
+            }
+            raft::copy_matrix<float>(d_block_data + chunk_offsets[chunk], dim,
+                                     d_padded_block_data + chunk * subspace_dim, padded_dim, width, cur_blk_size,
+                                     stream);
+        }
+        raft::copy(h_inflated_out, d_block_data, cur_blk_size * dim, stream);
     }
     raft::resource::sync_stream(dev_resources);
 }

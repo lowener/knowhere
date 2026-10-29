@@ -35,6 +35,9 @@
 #include "knowhere/comp/task.h"
 
 #include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
 #include <sys/stat.h>
 #include <time.h>
 #include <typeinfo>
@@ -602,11 +605,19 @@ int generate_pq_data_from_pivots(const std::string data_file,
   std::unique_ptr<raft::pinned_matrix<float, int64_t>> pinned_block_data_float;
   std::unique_ptr<raft::device_matrix<float, int64_t>> d_block_data_float;
   std::unique_ptr<raft::device_matrix<uint8_t, int64_t>> d_compressed_data_block;
-  if (is_gpu_available() && rearrengement_is_identity && num_centers <= 256 &&
-      (dim % num_pq_chunks == 0)) {
+  std::unique_ptr<raft::device_matrix<float, int64_t>> d_padded_block_data;
+  const bool padded_chunks = (dim % num_pq_chunks != 0);
+  if (is_gpu_available() && rearrengement_is_identity && num_centers <= 256) {
     pq_quantizer_ptr = initialize_pq_quantizer_gpu(
-        res, centroid.get(), full_pivot_data.get(), dim, num_centers, num_pq_chunks);
+        res, centroid.get(), full_pivot_data.get(), dim, num_centers, num_pq_chunks, chunk_offsets.get());
     if (pq_quantizer_ptr != nullptr) {
+      LOG_KNOWHERE_INFO_ << "Encoding " << num_pq_chunks << " PQ chunks of dim " << dim << " using cuvs::pq"
+                         << (padded_chunks ? " with zero-padded chunks" : "");
+      if (padded_chunks) {
+        const size_t padded_dim = padded_pq_chunk_width(chunk_offsets.get(), num_pq_chunks) * num_pq_chunks;
+        d_padded_block_data = std::make_unique<raft::device_matrix<float, int64_t>>(
+            raft::make_device_matrix<float, int64_t>(res, block_size, padded_dim));
+      }
       pinned_block_data_float = std::make_unique<raft::pinned_matrix<float, int64_t>>(
           raft::make_pinned_matrix<float, int64_t>(res, block_size, dim));
       block_data_float_ptr = pinned_block_data_float->data_handle();
@@ -649,7 +660,26 @@ int generate_pq_data_from_pivots(const std::string data_file,
                         << ")..";
     if (use_gpu) {
 #ifdef KNOWHERE_WITH_CUVS
-      if (pq_quantizer_ptr != nullptr) {
+      if (pq_quantizer_ptr != nullptr && padded_chunks) {
+        transform_padded_pq_gpu(res,
+                                *pq_quantizer_ptr,
+                                block_data_float_ptr,
+                                cur_blk_size,
+                                dim,
+                                num_pq_chunks,
+                                chunk_offsets.get(),
+                                d_block_data_float->data_handle(),
+                                d_padded_block_data->data_handle(),
+                                d_compressed_data_block->data_handle(),
+                                pVec.get(),
+#ifdef SAVE_INFLATED_PQ
+                                block_inflated_base.get()
+#else
+                                nullptr
+#endif
+        );
+        predicted_with_gpu = true;
+      } else if (pq_quantizer_ptr != nullptr) {
         transform_pq_gpu(res,
                          *pq_quantizer_ptr,
                          block_data_float_ptr,

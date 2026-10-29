@@ -115,6 +115,8 @@ void mean_center_gpu(const raft::resources& dev_resources,
                      bool compute_mean=true);
 
 // initialize a cuVS PQ quantizer from existing DiskANN centroid + pivot data.
+// when dim is not a multiple of num_pq_chunks, every chunk (given by chunk_offsets) is zero-padded to
+// padded_pq_chunk_width, and blocks must be encoded with transform_padded_pq_gpu.
 // returns nullptr when the requested shape/config is not supported by this path.
 std::unique_ptr<cuvs::preprocessing::quantize::pq::quantizer<float>>
 initialize_pq_quantizer_gpu(const raft::resources& dev_resources,
@@ -122,7 +124,8 @@ initialize_pq_quantizer_gpu(const raft::resources& dev_resources,
                             const float* h_full_pivot_data,
                             size_t dim,
                             size_t num_centers,
-                            size_t num_pq_chunks);
+                            size_t num_pq_chunks,
+                            const uint32_t* chunk_offsets);
 
 // GPU transform path for one block:
 // 1) host->device copy
@@ -139,6 +142,25 @@ void transform_pq_gpu(const raft::resources& dev_resources,
                       uint8_t* d_compressed_data_block,
                       uint8_t* h_codes_out,
                       float* h_inflated_out = nullptr);
+
+// width of the widest PQ chunk, i.e. the subspace width of the padded quantizer.
+size_t padded_pq_chunk_width(const uint32_t* chunk_offsets, size_t num_pq_chunks);
+
+// same as transform_pq_gpu for a quantizer of chunks of unequal width (dim not a multiple of num_pq_chunks).
+// d_block_data holds cur_blk_size x dim floats, d_padded_block_data cur_blk_size x
+// (padded_pq_chunk_width * num_pq_chunks) floats.
+void transform_padded_pq_gpu(const raft::resources& dev_resources,
+                             const cuvs::preprocessing::quantize::pq::quantizer<float>& pq_quantizer,
+                             const float* h_block_data,
+                             size_t cur_blk_size,
+                             size_t dim,
+                             size_t num_pq_chunks,
+                             const uint32_t* chunk_offsets,
+                             float* d_block_data,
+                             float* d_padded_block_data,
+                             uint8_t* d_compressed_data_block,
+                             uint8_t* h_codes_out,
+                             float* h_inflated_out = nullptr);
 
 // assign function for computes the compressed PQ vector per each vector in the dataset
 // based on centroids computation
